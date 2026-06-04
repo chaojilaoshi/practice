@@ -5,6 +5,8 @@ import com.practice.invoke.entity.ApiConfig;
 import com.practice.invoke.enums.InvokeType;
 import com.practice.invoke.enums.ParamType;
 import com.practice.invoke.exception.BizException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -33,6 +35,8 @@ import java.util.Map;
  */
 @Service
 public class ApiInvokeService {
+
+    private static final Logger log = LoggerFactory.getLogger(ApiInvokeService.class);
 
     private final ApiConfigService apiConfigService;
     private final RestTemplate loadBalancedRestTemplate;
@@ -98,8 +102,14 @@ public class ApiInvokeService {
                 ? new RestTemplate(HttpClientConfig.buildFactory(cfg.getConnectTimeout(), cfg.getReadTimeout()))
                 : loadBalancedRestTemplate;
 
+        // 打印 exchange 的实际入参，便于排查「实际拼出来的请求长什么样」
+        log.debug("[invoke] apiName={}, mode={}, exchange(url={}, method={}, headers={}, body={}, respType={})",
+                apiName, direct ? "DIRECT(base_url)" : "NACOS(service_name)",
+                url, method, headers, body, respType.getSimpleName());
+
         try {
             ResponseEntity<T> resp = restTemplate.exchange(url, method, entity, respType);
+            log.debug("[invoke] apiName={}, status={}, respBody={}", apiName, resp.getStatusCode(), resp.getBody());
             return resp.getBody();
         } catch (RestClientException e) {
             throw new BizException("调用接口失败: apiName=" + apiName + ", url=" + url, e);
