@@ -1,0 +1,37 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: generic-invoke
+  # ---- 数据源：demo 用 H2 内存库；生产换成 MySQL 驱动 + 连接串即可 ----
+  datasource:
+    url: jdbc:h2:mem:invoke;MODE=MySQL;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  sql:
+    init:
+      mode: always          # 启动时执行 schema.sql / data.sql
+  h2:
+    console:
+      enabled: true
+  cloud:
+    nacos:
+      discovery:
+        # demo 默认关闭 Nacos（无需启动 Nacos 即可跑）。
+        # 生产环境改为 true，并配置 server-addr / namespace / group，
+        # 即可让 api_config.service_name 走服务名 + 负载均衡直连。
+        enabled: false
+        register-enabled: false
+        server-addr: 127.0.0.1:8848
+        namespace: dev
+        group: DEFAULT_GROUP
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true   # api_name <-> apiName 驼峰映射
+
+logging:
+  level:
+    com.practice.invoke: debug
