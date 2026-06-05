@@ -144,6 +144,67 @@ OPENAI_UPSTREAM=https://api.freemodel.dev ANTHROPIC_UPSTREAM=https://cc.freemode
 | `ANTHROPIC_COMPAT` | 关闭（透明直通） | 设为 `chat` 时开启「协议翻译」：把进来的 Anthropic `/v1/messages` 翻译成 OpenAI `/v1/chat/completions` 发往 `OPENAI_UPSTREAM`（见下一节） |
 | `MODEL_MAP` | 空 | 模型映射表，JSON（`{"claude-sonnet-4-6":"gpt-4o"}`）或逗号分隔（`claude-sonnet-4-6=gpt-4o,claude-haiku-4-5=gpt-4o-mini`）；没命中就原样透传模型名 |
 | `MODEL_MAP_FILE` | 空 | 模型映射 JSON 文件路径（优先于 `MODEL_MAP`） |
+| `PROVIDERS` | 空 | 供应商池，JSON 数组（见「弹性」节）。配了池就启用故障转移+熔断 |
+| `PROVIDERS_FILE` | 空 | 供应商池 JSON 文件路径（优先于 `PROVIDERS`） |
+| `BREAKER` | 关闭 | 设 `1` 强制开启熔断；**配了 `PROVIDERS` 池时自动开启** |
+| `BREAKER_FAILURES` | `5` | 单个供应商连续失败多少次后熔断（OPEN） |
+| `BREAKER_COOLDOWN_MS` | `30000` | 熔断后冷却多久（毫秒）才放探测请求（HALF_OPEN） |
+| `BREAKER_HALFOPEN_MAX` | `1` | HALF_OPEN 时允许的并发探测数 |
+| `FAILOVER_STATUSES` | `429,500,502,503,504` | 触发故障转移的上游状态码（逗号分隔） |
+| `RECTIFY` / `RECTIFIER` | 关闭 | 设 `1` 开启 Anthropic thinking 整流（仅作用于 `/v1/messages`） |
+| `RECTIFY_SIGNATURE` | 开启 | 设 `0` 关闭「签名整流」子规则 |
+| `RECTIFY_BUDGET` | 开启 | 设 `0` 关闭「budget 整流」子规则 |
+
+## 弹性：多供应商故障转移 + 熔断 + thinking 整流（全部 opt-in）
+
+> 这三块**默认全关**，不配就和以前完全一样（透明直通、字节级不变）。只有显式配置时才进入「弹性路径」。三套实现（Node/Python/Java）逻辑一致。
+
+### 1) 多供应商池 + 故障转移（failover）
+
+用 `PROVIDERS`（或 `PROVIDERS_FILE`）配一个有序的供应商池。每个供应商：
+
+```json
+[
+  { "id": "anthropic-main", "group": "anthropic", "baseUrl": "https://api.vendor-a.com", "apiKey": "sk-a" },
+  { "id": "anthropic-backup", "group": "anthropic", "baseUrl": "https://api.vendor-b.com", "apiKey": "sk-b" },
+  { "id": "openai-main", "group": "openai", "baseUrl": "https://api.vendor-c.com" }
+]
+```
+
+- **`group`**：`anthropic`（匹配 `/v1/messages`）或 `openai`（匹配 `/v1/responses` 与 `/v1/chat/completions`）。也可写 `wire`（`messages`→anthropic，`responses`/`chat`→openai）。
+- **`id`**：缺省自动生成（`anthropic-0`…），是熔断器的 key。
+- **`apiKey`**：可选。给了就用它替换客户端凭证（anthropic 发 `x-api-key`，openai 发 `Authorization: Bearer`）；不给则原样转发客户端凭证。
+- **`baseUrl`**：上游根地址（末尾 `/` 自动去掉）。请求按池顺序尝试。
+- 池为空时回退到单上游（`ANTHROPIC_UPSTREAM`/`OPENAI_UPSTREAM`），即旧行为。
+
+**故障转移语义（关键）**：只在「**还没把响应流给客户端之前**」切换——即上游**连接失败**或返回**故障转移状态码**（默认 429/500/502/503/504）时，记一次失败并试下一个供应商。**一旦上游回了 2xx 开始流式回写，就不再切换**（避免重放、保证保真）。其它非 2xx（如 400/401/403）视为终止错误，原样回写客户端、不再故障转移。池全部失败则把最后一次上游错误原样回放给客户端。
+
+### 2) 熔断（circuit breaker）
+
+每个供应商一个独立熔断器，状态机 `CLOSED → OPEN → HALF_OPEN`：
+
+- 连续失败累计到 `BREAKER_FAILURES`（默认 5）→ **OPEN**，在 `BREAKER_COOLDOWN_MS`（默认 30s）内直接跳过该供应商；
+- 冷却后进入 **HALF_OPEN**，放最多 `BREAKER_HALFOPEN_MAX`（默认 1）个探测请求，成功则回到 CLOSED，失败则重新 OPEN；
+- **每次请求结束都会释放 HALF_OPEN 探测名额**（避免探测名额泄漏导致熔断器卡死）；
+- **区分错误类型**：上游真故障（连接失败 / 故障转移状态码）才计入失败；客户端类错误（如 400/401，以及被整流的请求）记为「中性」，不计入熔断。
+- 配了 `PROVIDERS` 池就自动开启熔断；没有池时可用 `BREAKER=1` 单独开启（对单上游也生效）。
+
+### 3) Anthropic thinking 整流器（rectifier，仅 `/v1/messages`）
+
+跨供应商切换或换模型时，历史 `thinking` 块签名/budget 约束可能被新上游拒。开启 `RECTIFY=1` 后，代理检测到特定错误会**改写请求体并对同一供应商重试一次**（重试在故障转移之前）：
+
+- **签名整流**（`RECTIFY_SIGNATURE`，默认开）：上游报 thinking 签名校验错 → 删掉历史消息里的 `thinking`/`redacted_thinking` 块及各块的 `signature` 字段 → 重试一次。
+- **budget 整流**（`RECTIFY_BUDGET`，默认开）：上游报 `budget_tokens` 约束错（如要求 ≥1024）→ 把 `thinking.type` 设 `enabled`、`budget_tokens=32000`，必要时把 `max_tokens` 提到 64000 → 重试一次。
+- 只整流**一次**；整流后仍失败则进入故障转移。整流触发的失败计为「中性」，不计入熔断。
+
+> 落盘：走弹性路径的请求在 JSONL 里带一个 `resilience` 字段（`{providerId, attempt, rectified?, failedOver?}`），便于排查实际命中了哪个供应商、是否发生了整流/故障转移。
+
+**最小示例（两个 anthropic 供应商 + 熔断 + 整流）**
+```bash
+PROVIDERS='[{"id":"a","group":"anthropic","baseUrl":"https://api.vendor-a.com","apiKey":"sk-a"},{"id":"b","group":"anthropic","baseUrl":"https://api.vendor-b.com","apiKey":"sk-b"}]' \
+RECTIFY=1 \
+npm start
+```
 
 ## 协议翻译：让只支持 `/v1/chat/completions` 的厂商也能跑 Claude Code
 

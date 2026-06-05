@@ -15,10 +15,26 @@
 //                       (e.g. {"claude-sonnet-4-6":"gpt-4o"}) OR comma list
 //                       (e.g. "claude-sonnet-4-6=gpt-4o,claude-haiku-4-5=gpt-4o-mini").
 //   MODEL_MAP_FILE   path to a JSON file with the same mapping (alternative to MODEL_MAP).
+//
+//   --- resilience (all opt-in; default behavior is unchanged when unset) ---
+//   PROVIDERS        JSON array of failover providers, each
+//                    {id, group:"anthropic"|"openai", baseUrl, apiKey?}. When a
+//                    group's pool is non-empty we try its providers in order.
+//   PROVIDERS_FILE   path to a JSON file with the same array.
+//   BREAKER          "1"/"on" to enable the circuit breaker (auto-on when a
+//                    provider pool is configured).
+//   BREAKER_FAILURES failures before a provider opens          (default 5)
+//   BREAKER_COOLDOWN_MS  open-state cooldown in ms             (default 30000)
+//   BREAKER_HALFOPEN_MAX concurrent half-open probes           (default 1)
+//   FAILOVER_STATUSES    comma list of HTTP statuses that trigger failover
+//                        (default 429,500,502,503,504)
+//   RECTIFY          "1"/"on" to enable Anthropic thinking rectification.
+//   RECTIFY_SIGNATURE / RECTIFY_BUDGET  "0" to disable one sub-rule.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseProviders } from './providers.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -65,6 +81,32 @@ function loadModelMap() {
   return parseModelMap(process.env.MODEL_MAP);
 }
 
+function boolEnv(name) {
+  const v = (process.env[name] || '').toLowerCase();
+  return v === '1' || v === 'on' || v === 'true' || v === 'yes';
+}
+
+function loadProviders() {
+  if (process.env.PROVIDERS_FILE) {
+    try {
+      return parseProviders(fs.readFileSync(process.env.PROVIDERS_FILE, 'utf8'));
+    } catch (err) {
+      console.error('[config] failed to read PROVIDERS_FILE:', err.message);
+    }
+  }
+  return parseProviders(process.env.PROVIDERS);
+}
+
+function parseStatuses(raw, fallback) {
+  if (!raw || typeof raw !== 'string') return new Set(fallback);
+  const out = new Set();
+  for (const tok of raw.split(',')) {
+    const n = Number.parseInt(tok.trim(), 10);
+    if (Number.isFinite(n)) out.add(n);
+  }
+  return out.size ? out : new Set(fallback);
+}
+
 export function loadConfig(overrides = {}) {
   return {
     proxyPort: intEnv('PROXY_PORT', 8788),
@@ -81,6 +123,23 @@ export function loadConfig(overrides = {}) {
       // to the OpenAI upstream. null = transparent pass-through (default).
       anthropicTo: (process.env.ANTHROPIC_COMPAT || '').toLowerCase() === 'chat' ? 'chat' : null,
       modelMap: loadModelMap(),
+    },
+    providers: {
+      // Grouped failover pools. Empty pools => fall back to single upstream.
+      pools: loadProviders(),
+    },
+    breaker: {
+      // Auto-enable the breaker when a provider pool exists; otherwise opt-in.
+      enabled: boolEnv('BREAKER'),
+      failureThreshold: intEnv('BREAKER_FAILURES', 5),
+      cooldownMs: intEnv('BREAKER_COOLDOWN_MS', 30000),
+      halfOpenMax: intEnv('BREAKER_HALFOPEN_MAX', 1),
+      failoverStatuses: parseStatuses(process.env.FAILOVER_STATUSES, [429, 500, 502, 503, 504]),
+    },
+    rectifier: {
+      enabled: boolEnv('RECTIFY') || boolEnv('RECTIFIER'),
+      signature: process.env.RECTIFY_SIGNATURE !== '0',
+      budget: process.env.RECTIFY_BUDGET !== '0',
     },
     ...overrides,
   };

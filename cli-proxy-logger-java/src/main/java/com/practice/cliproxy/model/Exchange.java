@@ -25,4 +25,10 @@ public class Exchange {
      * 透明转发时为 null。
      */
     public Map<String, Object> translation;
+    /**
+     * 弹性元数据（仅当走「弹性路径」——provider 故障转移 / 熔断 / 整流——时存在）：
+     * 记录 {providerId, attempt, failedOver?, rectifyTriggered?, rectified?}。
+     * 普通透明转发时为 null。
+     */
+    public Map<String, Object> resilience;
 }

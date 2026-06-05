@@ -15,11 +15,27 @@ Env vars (all optional):
                         (e.g. {"claude-sonnet-4-6":"gpt-4o"}) OR comma list
                         (e.g. "claude-sonnet-4-6=gpt-4o,claude-haiku-4-5=gpt-4o-mini").
     MODEL_MAP_FILE      path to a JSON file with the same mapping (alternative to MODEL_MAP).
+
+    --- resilience (all opt-in; default behavior is unchanged when unset) ---
+    PROVIDERS           JSON array of failover providers, each
+                        {id, group:"anthropic"|"openai", baseUrl, apiKey?}.
+    PROVIDERS_FILE      path to a JSON file with the same array.
+    BREAKER             "1"/"on" to enable the circuit breaker (auto-on when a
+                        provider pool is configured).
+    BREAKER_FAILURES    failures before a provider opens          (default 5)
+    BREAKER_COOLDOWN_MS open-state cooldown in ms                 (default 30000)
+    BREAKER_HALFOPEN_MAX concurrent half-open probes              (default 1)
+    FAILOVER_STATUSES   comma list of HTTP statuses that trigger failover
+                        (default 429,500,502,503,504)
+    RECTIFY             "1"/"on" to enable Anthropic thinking rectification.
+    RECTIFY_SIGNATURE / RECTIFY_BUDGET  "0" to disable one sub-rule.
 """
 
 import json
 import os
 from pathlib import Path
+
+from .providers import parse_providers
 
 _MODULE_ROOT = Path(__file__).resolve().parent.parent
 
@@ -70,6 +86,34 @@ def _load_model_map():
     return parse_model_map(os.environ.get("MODEL_MAP"))
 
 
+def _bool_env(name):
+    return (os.environ.get(name) or "").lower() in ("1", "on", "true", "yes")
+
+
+def _load_providers():
+    path = os.environ.get("PROVIDERS_FILE")
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return parse_providers(fh.read())
+        except OSError as err:
+            print(f"[config] failed to read PROVIDERS_FILE: {err}")
+    return parse_providers(os.environ.get("PROVIDERS"))
+
+
+def _parse_statuses(raw, fallback):
+    if not isinstance(raw, str) or not raw:
+        return set(fallback)
+    out = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        try:
+            out.add(int(tok))
+        except ValueError:
+            continue
+    return out or set(fallback)
+
+
 def load_config(**overrides):
     config = {
         "proxyPort": _int_env("PROXY_PORT", 8788),
@@ -86,6 +130,23 @@ def load_config(**overrides):
             # sent to the OpenAI upstream. None = transparent pass-through (default).
             "anthropicTo": "chat" if (os.environ.get("ANTHROPIC_COMPAT") or "").lower() == "chat" else None,
             "modelMap": _load_model_map(),
+        },
+        "providers": {
+            # Grouped failover pools. Empty pools => fall back to single upstream.
+            "pools": _load_providers(),
+        },
+        "breaker": {
+            # Auto-enable the breaker when a provider pool exists; otherwise opt-in.
+            "enabled": _bool_env("BREAKER"),
+            "failureThreshold": _int_env("BREAKER_FAILURES", 5),
+            "cooldownMs": _int_env("BREAKER_COOLDOWN_MS", 30000),
+            "halfOpenMax": _int_env("BREAKER_HALFOPEN_MAX", 1),
+            "failoverStatuses": _parse_statuses(os.environ.get("FAILOVER_STATUSES"), [429, 500, 502, 503, 504]),
+        },
+        "rectifier": {
+            "enabled": _bool_env("RECTIFY") or _bool_env("RECTIFIER"),
+            "signature": os.environ.get("RECTIFY_SIGNATURE") != "0",
+            "budget": os.environ.get("RECTIFY_BUDGET") != "0",
         },
     }
     config.update(overrides)

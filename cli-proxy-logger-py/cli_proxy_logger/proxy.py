@@ -19,8 +19,11 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+from .breaker import BreakerRegistry
 from .model import safe_json_parse
 from .parsers import PARSERS, openai_chat
+from .providers import resolve_candidates, wire_to_group
+from .rectifier import detect_rectification, apply_rectification
 from .sse import SSEParser
 from .translate import (
     anthropic_request_to_chat,
@@ -100,7 +103,32 @@ def _truncate(buf, max_bytes):
     return buf[:max_bytes].decode("utf-8", "replace") + f"\n...[truncated {len(buf) - max_bytes} bytes]"
 
 
+def _is_resilient(config, wire):
+    """True when any resilience feature (provider pool / breaker / rectifier) is
+    active for this request. When False we take the original transparent path so
+    default behavior is unchanged."""
+    group = wire_to_group(wire)
+    pool = ((config.get("providers") or {}).get("pools") or {}).get(group)
+    if isinstance(pool, list) and len(pool) > 0:
+        return True
+    if (config.get("breaker") or {}).get("enabled"):
+        return True
+    if (config.get("rectifier") or {}).get("enabled") and wire == "anthropic":
+        return True
+    return False
+
+
+def _split_upstream(base_url):
+    split = urlsplit(base_url)
+    scheme = split.scheme or "https"
+    return scheme, split.hostname, split.port or (443 if scheme == "https" else 80), split.netloc
+
+
 def _make_handler(config, recorder):
+    # One breaker registry per proxy instance, shared across all requests so a
+    # provider's failure state persists between requests.
+    breakers = BreakerRegistry(config.get("breaker") or {})
+
     class ProxyHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -132,6 +160,12 @@ def _make_handler(config, recorder):
             if (compat.get("anthropicTo") == "chat" and wire == "anthropic"
                     and self.path.split("?")[0].startswith("/v1/messages")):
                 self._handle_anthropic_to_chat(config, recorder, req_body, started)
+                return
+
+            # Resilient transparent path: provider failover + circuit breaker +
+            # (Anthropic) thinking rectification. Only taken when opted in.
+            if _is_resilient(config, wire):
+                self._handle_resilient(config, recorder, req_body, started, wire)
                 return
 
             parser = PARSERS[wire]
@@ -515,6 +549,285 @@ def _make_handler(config, recorder):
             recorder.record(exchange)
             conn.close()
 
+        # =================================================================
+        # Resilient transparent path: provider failover + circuit breaker +
+        # (Anthropic) thinking rectification. Reached only when _is_resilient()
+        # is True; the default transparent path (_handle) is left untouched so
+        # non-resilient traffic is byte-for-byte identical to before.
+        #
+        # Per client request we walk the ordered provider candidates. For each:
+        #   - skip it if its breaker is OPEN (cooldown not elapsed);
+        #   - send the request; on a 2xx we COMMIT (stream bytes to the client)
+        #     and stop;
+        #   - on a connection error or "failover status" (default 429/5xx) we
+        #     record the failure and try the NEXT provider;
+        #   - on a rectifiable Anthropic error we rewrite the body and retry the
+        #     SAME provider ONCE (a client-compat fix, NOT a breaker failure);
+        #   - any other error (401/403/400/...) is committed to the client as-is.
+        # Failover is only possible BEFORE we stream a 2xx to the client.
+        # =================================================================
+        def _base_out_headers(self):
+            out = {}
+            for k, v in self.headers.items():
+                lk = k.lower()
+                if lk in HOP_BY_HOP:
+                    continue
+                if lk == "accept-encoding":
+                    out[k] = "gzip, deflate"
+                    continue
+                out[k] = v
+            return out
+
+        def _make_exchange(self, wire, url, body_bytes, started):
+            parser = PARSERS[wire]
+            try:
+                parsed_request = parser.parse_request(body_bytes.decode("utf-8", "replace"))
+            except Exception:
+                parsed_request = {"wire": wire, "model": None, "messages": [],
+                                  "tools": [], "stream": False, "raw": None}
+            return {
+                "id": str(uuid.uuid4()),
+                "ts": started.isoformat().replace("+00:00", "Z"),
+                "durationMs": 0,
+                "wire": wire,
+                "method": self.command,
+                "url": url,
+                "reqHeaders": _redact_headers(self.headers.items(), config["redactAuth"]),
+                "requestBodyRaw": _truncate(body_bytes, config["maxBodyBytes"]),
+                "request": parsed_request,
+                "resStatus": 0,
+                "resHeaders": {},
+                "response": None,
+                "error": None,
+            }
+
+        def _commit_stream(self, upstream_res, parser, exchange, started):
+            """Stream a 2xx response to the client while teeing a decoded copy
+            into the parser. Mirrors steps 5-7 of the transparent path."""
+            res_header_pairs = upstream_res.getheaders()
+            exchange["resStatus"] = upstream_res.status
+            exchange["resHeaders"] = {k: v for k, v in res_header_pairs}
+            content_type = upstream_res.getheader("content-type") or ""
+            is_sse = "text/event-stream" in content_type
+            content_encoding = upstream_res.getheader("content-encoding")
+
+            self.send_response_only(upstream_res.status, upstream_res.reason)
+            for k, v in res_header_pairs:
+                if k.lower() in HOP_BY_HOP:
+                    continue
+                self.send_header(k, v)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
+            sse = SSEParser() if is_sse else None
+            agg = parser.create_stream_aggregator() if is_sse else None
+            if sse:
+                sse.on("event", lambda e: agg["feed"](e))
+            decode = _make_stream_decoder(content_encoding)
+            raw_copy = bytearray()
+
+            def on_decoded(buf):
+                if not buf:
+                    return
+                if sse:
+                    sse.push(buf.decode("utf-8", "replace"))
+                elif len(raw_copy) < config["maxBodyBytes"]:
+                    raw_copy.extend(buf)
+
+            client_alive = True
+            while True:
+                chunk = upstream_res.read(65536)
+                if not chunk:
+                    break
+                if client_alive:
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionError, OSError):
+                        client_alive = False
+                on_decoded(decode(chunk))
+
+            try:
+                if sse:
+                    sse.flush()
+                    exchange["response"] = agg["result"]()
+                else:
+                    exchange["response"] = parser.parse_response(bytes(raw_copy).decode("utf-8", "replace"))
+            except Exception as err:
+                exchange["response"] = {"text": "", "toolCalls": [], "stopReason": None,
+                                        "usage": None, "raw": None, "parseError": str(err)}
+            exchange["durationMs"] = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            recorder.record(exchange)
+
+        def _handle_resilient(self, config, recorder, req_body, started, wire):
+            parser = PARSERS[wire]
+            candidates = resolve_candidates(config, wire)
+            group = wire_to_group(wire)
+            pool_configured = len((((config.get("providers") or {}).get("pools") or {}).get(group)) or []) > 0
+            use_breaker = bool((config.get("breaker") or {}).get("enabled") or pool_configured)
+            failover_statuses = (config.get("breaker") or {}).get("failoverStatuses") or {429, 500, 502, 503, 504}
+            rectify_on = bool((config.get("rectifier") or {}).get("enabled") and wire == "anthropic")
+
+            base_headers = self._base_out_headers()
+            anth_obj = (safe_json_parse(req_body.decode("utf-8", "replace")) or {}) if wire == "anthropic" else None
+
+            last_error = None  # (status, header_pairs, raw_bytes) of most recent failover
+            attempt_no = 0
+            attempted_any = False
+
+            for i, cand in enumerate(candidates):
+                is_last = i == len(candidates) - 1
+                permit = {"allowed": True, "halfOpen": False}
+                if use_breaker:
+                    permit = breakers.can_request(cand["id"])
+                    if not permit["allowed"]:
+                        continue
+                attempted_any = True
+
+                body_bytes = req_body
+                rectified_kind = None
+                rectify_tried = False
+
+                while True:
+                    attempt_no += 1
+                    scheme, host, port, netloc = _split_upstream(cand["baseUrl"])
+                    url = f"{scheme}://{netloc}{self.path}"
+                    out_headers = dict(base_headers)
+                    out_headers["Host"] = netloc
+                    if body_bytes:
+                        out_headers["Content-Length"] = str(len(body_bytes))
+                    if cand.get("apiKey"):
+                        # swap in this provider's credential, dropping the other style
+                        for hk in list(out_headers):
+                            if hk.lower() in ("authorization", "x-api-key"):
+                                del out_headers[hk]
+                        if wire == "anthropic":
+                            out_headers["x-api-key"] = cand["apiKey"]
+                        else:
+                            out_headers["Authorization"] = f"Bearer {cand['apiKey']}"
+
+                    exchange = self._make_exchange(wire, url, body_bytes, started)
+                    exchange["resilience"] = {"providerId": cand["id"], "attempt": attempt_no}
+                    if rectified_kind:
+                        exchange["resilience"]["rectified"] = rectified_kind
+
+                    if scheme == "https":
+                        conn = http.client.HTTPSConnection(host, port, timeout=600)
+                    else:
+                        conn = http.client.HTTPConnection(host, port, timeout=600)
+                    try:
+                        conn.request(self.command, self.path, body=body_bytes or None, headers=out_headers)
+                        upstream_res = conn.getresponse()
+                    except Exception as err:
+                        exchange["error"] = f"upstream request error: {err}"
+                        exchange["durationMs"] = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                        exchange["resilience"]["failedOver"] = not is_last
+                        recorder.record(exchange)
+                        if use_breaker:
+                            breakers.record_failure(cand["id"], permit["halfOpen"])
+                        conn.close()
+                        break  # next candidate
+
+                    status = upstream_res.status
+                    if 200 <= status < 300:
+                        self._commit_stream(upstream_res, parser, exchange, started)
+                        conn.close()
+                        if use_breaker:
+                            breakers.record_success(cand["id"], permit["halfOpen"])
+                        return
+
+                    # non-2xx: buffer the (decoded) error body fully.
+                    raw_bytes = upstream_res.read()
+                    decode = _make_stream_decoder(upstream_res.getheader("content-encoding"))
+                    text = decode(raw_bytes).decode("utf-8", "replace")
+                    obj = safe_json_parse(text)
+                    header_pairs = upstream_res.getheaders()
+                    conn.close()
+                    exchange["resStatus"] = status
+                    exchange["resHeaders"] = {k: v for k, v in header_pairs}
+                    err_msg = None
+                    if isinstance(obj, dict):
+                        e = obj.get("error")
+                        err_msg = (e.get("message") if isinstance(e, dict) else None) or obj.get("message")
+                    exchange["error"] = err_msg or f"upstream {status}"
+                    try:
+                        exchange["response"] = parser.parse_response(text)
+                    except Exception as err:
+                        exchange["response"] = {"text": "", "toolCalls": [], "stopReason": None,
+                                                "usage": None, "raw": None, "parseError": str(err)}
+
+                    # (a) rectifiable Anthropic error -> rewrite + retry SAME provider once.
+                    if rectify_on and not rectify_tried:
+                        kind = detect_rectification(status, obj, config.get("rectifier"))
+                        if kind:
+                            rectify_tried = True
+                            rectified_kind = kind
+                            exchange["resilience"]["rectifyTriggered"] = kind
+                            exchange["durationMs"] = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                            recorder.record(exchange)  # log pre-rectify failure (no breaker change)
+                            body_bytes = json.dumps(apply_rectification(kind, anth_obj)).encode("utf-8")
+                            continue  # retry same candidate (permit still held)
+
+                    # (b) failover-eligible and another provider remains -> next.
+                    if status in failover_statuses and not is_last:
+                        exchange["resilience"]["failedOver"] = True
+                        exchange["durationMs"] = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                        recorder.record(exchange)
+                        if use_breaker:
+                            breakers.record_failure(cand["id"], permit["halfOpen"])
+                        last_error = (status, header_pairs, raw_bytes)
+                        break
+
+                    # (c) terminal error -> commit to client as-is.
+                    self.send_response_only(status)
+                    for k, v in header_pairs:
+                        if k.lower() in HOP_BY_HOP:
+                            continue
+                        self.send_header(k, v)
+                    self.send_header("Content-Length", str(len(raw_bytes)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    if raw_bytes:
+                        self.wfile.write(raw_bytes)
+                    exchange["durationMs"] = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                    recorder.record(exchange)
+                    if use_breaker:
+                        if status in failover_statuses:
+                            breakers.record_failure(cand["id"], permit["halfOpen"])
+                        else:
+                            breakers.record_neutral(cand["id"], permit["halfOpen"])
+                    return
+
+            # All candidates exhausted: replay the last buffered error, else 502.
+            self.close_connection = True
+            if last_error is not None:
+                status, header_pairs, raw_bytes = last_error
+                self.send_response_only(status)
+                for k, v in header_pairs:
+                    if k.lower() in HOP_BY_HOP:
+                        continue
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(raw_bytes)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if raw_bytes:
+                    self.wfile.write(raw_bytes)
+            else:
+                msg = "all upstream providers failed" if attempted_any else "all providers unavailable (circuit open)"
+                if wire == "anthropic":
+                    payload = {"type": "error", "error": {"type": "proxy_error", "message": msg}}
+                else:
+                    payload = {"error": {"type": "proxy_error", "message": msg}}
+                out = json.dumps(payload).encode("utf-8")
+                self.send_response_only(502)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(out)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(out)
+
         # BaseHTTPRequestHandler dispatches by method name (do_GET, do_POST,
         # ...). We proxy every verb identically, so point them all at _handle.
         do_GET = _handle
@@ -525,6 +838,9 @@ def _make_handler(config, recorder):
         do_HEAD = _handle
         do_OPTIONS = _handle
 
+    # Expose the shared breaker registry for tests/introspection (mirrors the
+    # Node proxy's `proxy.breakers`).
+    ProxyHandler.breakers = breakers
     return ProxyHandler
 
 
@@ -532,6 +848,7 @@ def start_proxy(config, recorder):
     handler = _make_handler(config, recorder)
     server = ThreadingHTTPServer(("127.0.0.1", config["proxyPort"]), handler)
     server.daemon_threads = True
+    server.breakers = handler.breakers
     actual_port = server.server_address[1]
     config["proxyPort"] = actual_port
     print(f"[proxy] listening on http://127.0.0.1:{actual_port}")

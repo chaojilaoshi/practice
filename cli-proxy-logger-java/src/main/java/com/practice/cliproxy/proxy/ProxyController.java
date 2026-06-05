@@ -9,6 +9,10 @@ import com.practice.cliproxy.parser.ParserFactory;
 import com.practice.cliproxy.parser.StreamAggregator;
 import com.practice.cliproxy.parser.WireParser;
 import com.practice.cliproxy.recorder.ExchangeRecorder;
+import com.practice.cliproxy.resilience.BreakerRegistry;
+import com.practice.cliproxy.resilience.Provider;
+import com.practice.cliproxy.resilience.Providers;
+import com.practice.cliproxy.resilience.Rectifier;
 import com.practice.cliproxy.sse.SseParser;
 import com.practice.cliproxy.translator.Translator;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -68,6 +72,11 @@ public class ProxyController {
     private final Translator translator;
     private final ObjectMapper mapper;
 
+    // 弹性：整个代理共享一个熔断器注册表，使某 provider 的失败状态在多次请求间保留。
+    private final BreakerRegistry breakers;
+    // 解析后的供应商池（懒加载，首次用到时按当前配置解析一次）。
+    private volatile Map<String, List<Provider>> providerPools;
+
     public ProxyController(ProxyProperties props, UpstreamResolver resolver, ParserFactory parsers,
                            ExchangeRecorder recorder, Translator translator, ObjectMapper mapper) {
         this.props = props;
@@ -76,6 +85,42 @@ public class ProxyController {
         this.recorder = recorder;
         this.translator = translator;
         this.mapper = mapper;
+        this.breakers = new BreakerRegistry(props.resolveBreakerFailures(),
+                props.resolveBreakerCooldownMs(), props.resolveBreakerHalfOpenMax());
+    }
+
+    /** 暴露熔断器注册表（给 UI / 测试做内省，对应 Node 的 proxy.breakers）。 */
+    public BreakerRegistry getBreakers() {
+        return breakers;
+    }
+
+    private Map<String, List<Provider>> pools() {
+        Map<String, List<Provider>> p = providerPools;
+        if (p == null) {
+            synchronized (this) {
+                p = providerPools;
+                if (p == null) {
+                    p = Providers.parse(props.resolveProvidersRaw(), mapper);
+                    providerPools = p;
+                }
+            }
+        }
+        return p;
+    }
+
+    /**
+     * 是否对该 wire 走「弹性路径」（provider 池 / 熔断 / 整流任一启用）。返回 false
+     * 时走原来的透明路径，默认行为字节级不变。
+     */
+    private boolean isResilient(String wire) {
+        List<Provider> pool = pools().get(Providers.wireToGroup(wire));
+        if (pool != null && !pool.isEmpty()) {
+            return true;
+        }
+        if (props.isBreakerEnabled()) {
+            return true;
+        }
+        return props.isRectifyEnabled() && "anthropic".equals(wire);
     }
 
     @RequestMapping("/v1/**")
@@ -96,6 +141,13 @@ public class ProxyController {
         // 改写请求与响应的分支。
         if (props.isAnthropicToChat() && "anthropic".equals(up.wire) && path.startsWith("/v1/messages")) {
             handleAnthropicToChat(req, resp, reqBody, started);
+            return;
+        }
+
+        // 弹性透明路径：provider 故障转移 + 熔断 + （Anthropic）thinking 整流。
+        // 仅在 opt-in 时进入；否则保持下面原来的透明路径，行为字节级不变。
+        if (isResilient(up.wire)) {
+            handleResilient(req, resp, reqBody, started, up.wire, path, query);
             return;
         }
 
@@ -196,6 +248,326 @@ public class ProxyController {
         }
         ex.durationMs = System.currentTimeMillis() - started;
         recorder.record(ex);
+    }
+
+    // =================================================================
+    // 弹性透明路径：provider 故障转移 + 熔断 + （Anthropic）thinking 整流。
+    // 仅当 isResilient() 为 true 时进入；默认透明路径 proxy() 原样保留，所以非弹性
+    // 流量与之前字节级一致。
+    //
+    // 每个客户端请求按顺序遍历候选 provider，对每个：
+    //   - 熔断 OPEN（冷却未到）则跳过；
+    //   - 发请求；2xx 则提交（把字节流回客户端）并结束；
+    //   - 连接错误或「故障转移状态」（默认 429/5xx）则记失败并试下一个；
+    //   - 可整流的 Anthropic 错误则改写请求体、对同一 provider 重试一次（属客户端
+    //     兼容修复，不计入熔断失败）；
+    //   - 其它错误（401/403/400…）原样提交给客户端。
+    // 故障转移只能在「把 2xx 流给客户端之前」发生。
+    // =================================================================
+    private void handleResilient(HttpServletRequest req, HttpServletResponse resp, byte[] reqBody, long started,
+                                 String wire, String path, String query) throws Exception {
+        WireParser parser = parsers.get(wire);
+        String fallbackBaseUrl = "anthropic".equals(wire) ? props.getAnthropicUpstream() : props.getOpenaiUpstream();
+        List<Provider> candidates = Providers.resolveCandidates(pools(), wire, fallbackBaseUrl);
+        String group = Providers.wireToGroup(wire);
+        List<Provider> pool = pools().get(group);
+        boolean poolConfigured = pool != null && !pool.isEmpty();
+        boolean useBreaker = props.isBreakerEnabled() || poolConfigured;
+        Set<Integer> failoverStatuses = props.resolveFailoverStatuses();
+        boolean rectifyOn = props.isRectifyEnabled() && "anthropic".equals(wire);
+        boolean sigOn = props.isRectifySignatureEnabled();
+        boolean budgetOn = props.isRectifyBudgetEnabled();
+        JsonNode anthObj = "anthropic".equals(wire) ? treeOrEmpty(new String(reqBody, StandardCharsets.UTF_8)) : null;
+
+        int lastStatus = -1;
+        byte[] lastBody = null;
+        Map<String, String> lastHeaders = null;
+        int attemptNo = 0;
+        boolean attemptedAny = false;
+
+        for (int i = 0; i < candidates.size(); i++) {
+            Provider cand = candidates.get(i);
+            boolean isLast = i == candidates.size() - 1;
+            BreakerRegistry.Permit permit = new BreakerRegistry.Permit(true, false);
+            if (useBreaker) {
+                permit = breakers.canRequest(cand.id);
+                if (!permit.allowed) {
+                    continue;
+                }
+            }
+            attemptedAny = true;
+
+            byte[] bodyBytes = reqBody;
+            String rectifiedKind = null;
+            boolean rectifyTried = false;
+
+            while (true) {
+                attemptNo++;
+                String url = cand.baseUrl + path + (query != null ? "?" + query : "");
+                Exchange ex = newResilientExchange(req, wire, url, bodyBytes, started);
+                Map<String, Object> meta = new LinkedHashMap<>();
+                meta.put("providerId", cand.id);
+                meta.put("attempt", attemptNo);
+                if (rectifiedKind != null) {
+                    meta.put("rectified", rectifiedKind);
+                }
+                ex.resilience = meta;
+
+                HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+                conn.setInstanceFollowRedirects(false);
+                conn.setRequestMethod(req.getMethod());
+                forwardResilientHeaders(req, conn, wire, cand);
+                if (bodyBytes.length > 0) {
+                    conn.setDoOutput(true);
+                    conn.setFixedLengthStreamingMode(bodyBytes.length);
+                    try (OutputStream os = conn.getOutputStream()) {
+                        os.write(bodyBytes);
+                    }
+                }
+
+                int status;
+                try {
+                    status = conn.getResponseCode();
+                } catch (Exception e) {
+                    ex.error = "upstream request error: " + e.getMessage();
+                    ex.durationMs = System.currentTimeMillis() - started;
+                    meta.put("failedOver", !isLast);
+                    recorder.record(ex);
+                    if (useBreaker) {
+                        breakers.recordFailure(cand.id, permit.halfOpen);
+                    }
+                    conn.disconnect();
+                    break; // 下一个候选
+                }
+
+                if (status >= 200 && status < 300) {
+                    commitResilientStream(conn, parser, ex, resp, started, status);
+                    if (useBreaker) {
+                        breakers.recordSuccess(cand.id, permit.halfOpen);
+                    }
+                    return;
+                }
+
+                // 非 2xx：完整缓冲（已解压的）错误体。
+                InputStream errStream = conn.getErrorStream();
+                if (errStream == null) {
+                    errStream = new ByteArrayInputStream(new byte[0]);
+                }
+                byte[] raw = readAll(errStream);
+                errStream.close();
+                String text = new String(raw, StandardCharsets.UTF_8);
+                JsonNode obj = treeOrNull(text);
+                Map<String, String> headers = collectResponseHeaders(conn);
+                conn.disconnect();
+                ex.resStatus = status;
+                ex.resHeaders = headers;
+                ex.error = errorMessage(obj, status);
+                try {
+                    ex.response = parser.parseResponse(text);
+                } catch (Exception e) {
+                    NormalizedResponse r = new NormalizedResponse();
+                    r.parseError = e.getMessage();
+                    ex.response = r;
+                }
+
+                // (a) 可整流的 Anthropic 错误 -> 改写 + 对同一 provider 重试一次。
+                if (rectifyOn && !rectifyTried) {
+                    String kind = Rectifier.detect(status, obj, sigOn, budgetOn);
+                    if (kind != null) {
+                        rectifyTried = true;
+                        rectifiedKind = kind;
+                        meta.put("rectifyTriggered", kind);
+                        ex.durationMs = System.currentTimeMillis() - started;
+                        recorder.record(ex); // 记录整流前失败（不动熔断）
+                        bodyBytes = mapper.writeValueAsBytes(Rectifier.apply(kind, anthObj, mapper));
+                        continue; // 重试同一候选（permit 仍持有）
+                    }
+                }
+
+                // (b) 可故障转移且还有下一个 provider -> 试下一个。
+                if (failoverStatuses.contains(status) && !isLast) {
+                    meta.put("failedOver", true);
+                    ex.durationMs = System.currentTimeMillis() - started;
+                    recorder.record(ex);
+                    if (useBreaker) {
+                        breakers.recordFailure(cand.id, permit.halfOpen);
+                    }
+                    lastStatus = status;
+                    lastBody = raw;
+                    lastHeaders = headers;
+                    break;
+                }
+
+                // (c) 终止错误 -> 原样回写客户端。
+                resp.setStatus(status);
+                for (Map.Entry<String, String> h : headers.entrySet()) {
+                    resp.setHeader(h.getKey(), h.getValue());
+                }
+                resp.setHeader("Content-Length", String.valueOf(raw.length));
+                if (raw.length > 0) {
+                    resp.getOutputStream().write(raw);
+                }
+                resp.flushBuffer(); // 提交响应，防止测试期 ErrorPageFilter 把 4xx/5xx 响应体清掉
+                ex.durationMs = System.currentTimeMillis() - started;
+                recorder.record(ex);
+                if (useBreaker) {
+                    if (failoverStatuses.contains(status)) {
+                        breakers.recordFailure(cand.id, permit.halfOpen);
+                    } else {
+                        breakers.recordNeutral(cand.id, permit.halfOpen);
+                    }
+                }
+                return;
+            }
+        }
+
+        // 候选耗尽：回放最后一次缓冲的错误，否则返回 502。
+        if (lastStatus != -1) {
+            resp.setStatus(lastStatus);
+            if (lastHeaders != null) {
+                for (Map.Entry<String, String> h : lastHeaders.entrySet()) {
+                    resp.setHeader(h.getKey(), h.getValue());
+                }
+            }
+            byte[] body = lastBody != null ? lastBody : new byte[0];
+            resp.setHeader("Content-Length", String.valueOf(body.length));
+            if (body.length > 0) {
+                resp.getOutputStream().write(body);
+            }
+            resp.flushBuffer();
+        } else {
+            String msg = attemptedAny ? "all upstream providers failed" : "all providers unavailable (circuit open)";
+            String payload = "anthropic".equals(wire)
+                    ? "{\"type\":\"error\",\"error\":{\"type\":\"proxy_error\",\"message\":\"" + msg + "\"}}"
+                    : "{\"error\":{\"type\":\"proxy_error\",\"message\":\"" + msg + "\"}}";
+            byte[] out = payload.getBytes(StandardCharsets.UTF_8);
+            resp.setStatus(502);
+            resp.setContentType("application/json; charset=utf-8");
+            resp.setHeader("Content-Length", String.valueOf(out.length));
+            resp.getOutputStream().write(out);
+            resp.flushBuffer();
+        }
+    }
+
+    // 2xx：把上游流回写给客户端，同时把解码副本喂给 parser（与透明路径的步骤 5-7 一致）。
+    private void commitResilientStream(HttpURLConnection conn, WireParser parser, Exchange ex,
+                                       HttpServletResponse resp, long started, int status) throws Exception {
+        ex.resStatus = status;
+        resp.setStatus(status);
+        ex.resHeaders = copyResponseHeaders(conn, resp);
+        String contentType = conn.getContentType();
+        boolean sse = contentType != null && contentType.contains("text/event-stream");
+        InputStream upstream = conn.getInputStream();
+        if (upstream == null) {
+            upstream = new ByteArrayInputStream(new byte[0]);
+        }
+        StreamAggregator agg = sse ? parser.newAggregator() : null;
+        SseParser sseParser = sse ? new SseParser(agg::feed) : null;
+        ByteArrayOutputStream copy = sse ? null : new ByteArrayOutputStream();
+        OutputStream clientOut = resp.getOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        try {
+            while ((n = upstream.read(buf)) != -1) {
+                clientOut.write(buf, 0, n);
+                clientOut.flush();
+                if (sse) {
+                    sseParser.push(new String(buf, 0, n, StandardCharsets.UTF_8));
+                } else if (copy.size() < props.getMaxBodyBytes()) {
+                    copy.write(buf, 0, n);
+                }
+            }
+        } catch (Exception e) {
+            ex.error = "upstream stream error: " + e.getMessage();
+        } finally {
+            upstream.close();
+            conn.disconnect();
+        }
+        try {
+            if (sse) {
+                sseParser.flush();
+                ex.response = agg.result();
+            } else {
+                ex.response = parser.parseResponse(new String(copy.toByteArray(), StandardCharsets.UTF_8));
+            }
+        } catch (Exception e) {
+            NormalizedResponse r = new NormalizedResponse();
+            r.parseError = e.getMessage();
+            ex.response = r;
+        }
+        ex.durationMs = System.currentTimeMillis() - started;
+        recorder.record(ex);
+    }
+
+    private Exchange newResilientExchange(HttpServletRequest req, String wire, String url, byte[] bodyBytes, long started) {
+        WireParser parser = parsers.get(wire);
+        Exchange ex = new Exchange();
+        ex.id = UUID.randomUUID().toString();
+        ex.ts = Instant.ofEpochMilli(started).toString();
+        ex.wire = wire;
+        ex.method = req.getMethod();
+        ex.url = url;
+        ex.reqHeaders = collectRequestHeaders(req);
+        ex.requestBodyRaw = truncate(bodyBytes);
+        try {
+            ex.request = parser.parseRequest(new String(bodyBytes, StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            ex.request = null;
+        }
+        return ex;
+    }
+
+    // 转发请求头到候选 provider：去掉逐跳头；当候选自带 apiKey 时，丢掉客户端的鉴权头
+    // 并换上该 provider 的凭证（Anthropic 用 x-api-key，OpenAI 用 Authorization: Bearer）。
+    private void forwardResilientHeaders(HttpServletRequest req, HttpURLConnection conn, String wire, Provider cand) {
+        boolean override = cand.apiKey != null;
+        Enumeration<String> names = req.getHeaderNames();
+        while (names.hasMoreElements()) {
+            String name = names.nextElement();
+            String lk = name.toLowerCase(Locale.ROOT);
+            if (HOP_BY_HOP.contains(lk)) {
+                continue;
+            }
+            if (override && (lk.equals("authorization") || lk.equals("x-api-key"))) {
+                continue;
+            }
+            conn.setRequestProperty(name, req.getHeader(name));
+        }
+        if (override) {
+            if ("anthropic".equals(wire)) {
+                conn.setRequestProperty("x-api-key", cand.apiKey);
+            } else {
+                conn.setRequestProperty("Authorization", "Bearer " + cand.apiKey);
+            }
+        }
+    }
+
+    private Map<String, String> collectResponseHeaders(HttpURLConnection conn) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (Map.Entry<String, List<String>> e : conn.getHeaderFields().entrySet()) {
+            String name = e.getKey();
+            if (name == null) {
+                continue;
+            }
+            if (HOP_BY_HOP.contains(name.toLowerCase(Locale.ROOT))) {
+                continue;
+            }
+            out.put(name, String.join(",", e.getValue()));
+        }
+        return out;
+    }
+
+    private String errorMessage(JsonNode obj, int status) {
+        if (obj != null && obj.isObject()) {
+            JsonNode err = obj.get("error");
+            if (err != null && err.isObject() && err.hasNonNull("message")) {
+                return err.get("message").asText();
+            }
+            if (obj.hasNonNull("message")) {
+                return obj.get("message").asText();
+            }
+        }
+        return "upstream " + status;
     }
 
     // =================================================================
