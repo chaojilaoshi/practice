@@ -32,6 +32,7 @@ mvn spring-boot:run
 
 - Claude Code：`export ANTHROPIC_BASE_URL=http://127.0.0.1:8788`（走 `/v1/messages`）
 - Codex（`~/.codex/config.toml`）：`openai_base_url = "http://127.0.0.1:8788/v1"`（走 `/v1/responses`，或 chat 模式 `/v1/chat/completions`）
+- opencode（`opencode.json`）：把 provider 的 `options.baseURL` 指到 `http://127.0.0.1:8788/v1`。`@ai-sdk/openai-compatible` 命中 chat、`@ai-sdk/openai` 命中 responses、内置 anthropic 命中 `/v1/messages`。三种 wire 都已实测可被本代理拦截（详见 Node 版 README 的「接入 opencode」配置示例）。
 
 ## 配置（application.yml，前缀 `proxy.*`）
 

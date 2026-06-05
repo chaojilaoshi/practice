@@ -71,9 +71,9 @@ wire_api = "responses"   # Codex 默认；也可设 "chat"
 
 Codex 默认走 OpenAI Responses 格式：`POST /v1/responses`（流式）；chat 模式走 `POST /v1/chat/completions`。
 
-## 接入 opencode（同样适用）
+## 接入 opencode（已实测可用）
 
-opencode 也支持「每个 provider 自定义 `baseURL`」，且底层走的就是本工具已支持的三种 wire 格式，所以**完全可以用这个代理拦截**。在 `opencode.json`（或 `~/.config/opencode/opencode.json`）里把 provider 的 `baseURL` 指到本地代理即可：
+opencode 也支持「每个 provider 自定义 `baseURL`」，且底层走的就是本工具已支持的三种 wire 格式，所以**完全可以用这个代理拦截**（本会话用 `opencode run` 实测：chat / responses 路径都抓到了工具调用参数与请求/响应体）。在 `opencode.json`（或 `~/.config/opencode/opencode.json`）里把 provider 的 `baseURL` 指到本地代理即可：
 
 ```jsonc
 {

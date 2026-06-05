@@ -64,6 +64,38 @@ wire_api = "responses"   # Codex 默认；也可设 "chat"
 
 Codex 默认走 OpenAI Responses 格式：`POST /v1/responses`（流式）；chat 模式走 `POST /v1/chat/completions`。
 
+## 接入 opencode（已实测可用）
+
+opencode 也支持「每个 provider 自定义 `baseURL`」，底层走的就是本工具已支持的三种 wire 格式，所以**完全可以用这个代理拦截**。在 `opencode.json`（或 `~/.config/opencode/opencode.json`）里把 provider 的 `baseURL` 指到本地代理即可：
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    // OpenAI 兼容（/v1/chat/completions） -> 命中 chat wire
+    "myproxy-chat": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local proxy (chat)",
+      "options": { "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "<your-key>" },
+      "models": { "gpt-5": { "name": "gpt-5 via proxy (chat)" } }
+    },
+    // OpenAI Responses（/v1/responses） -> 命中 responses wire
+    "myproxy-resp": {
+      "npm": "@ai-sdk/openai",
+      "name": "Local proxy (responses)",
+      "options": { "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "<your-key>" },
+      "models": { "gpt-5": { "name": "gpt-5 via proxy (responses)" } }
+    },
+    // Anthropic 模型（/v1/messages） -> 命中 anthropic wire（覆盖内置 anthropic 的 baseURL）
+    "anthropic": {
+      "options": { "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "<your-key>" }
+    }
+  }
+}
+```
+
+opencode 的 AI SDK client 会在 `baseURL` 后拼出 `/chat/completions`、`/responses` 或 `/messages`，正好命中代理按路径选 wire 的逻辑。本会话用 `opencode run -m <provider>/<model>` 实测：chat 与 responses 两条路径都成功抓到工具调用（如 `read`、`glob`）的参数与请求/响应体；anthropic 路径同样被正确路由并落盘（注意：若上游按特定 CLI 指纹放行——如只认 Claude Code——它可能拒绝 opencode，这属于上游限制，与代理无关）。
+
 ## 配置（环境变量）
 
 | 变量 | 默认 | 说明 |
