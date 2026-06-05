@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -20,7 +21,10 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.Enumeration;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -42,9 +46,10 @@ public class ProxyController {
     // 原样转发。这里还顺带去掉 host/content-length（为新连接重新计算）、
     // transfer-encoding（由 HttpURLConnection 重新分帧）、以及 accept-encoding
     // ——不带它就让 HttpURLConnection 自行协商 gzip 并透明解压，读到的即 identity。
-    private static final Set<String> HOP_BY_HOP = Set.of(
+    // 用 HashSet + Arrays.asList 构造（兼容 JDK 8；Java 9 的 Set.of 在 8 上不可用）。
+    private static final Set<String> HOP_BY_HOP = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
             "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-            "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length", "accept-encoding");
+            "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length", "accept-encoding")));
 
     private final ProxyProperties props;
     private final UpstreamResolver resolver;
@@ -62,7 +67,7 @@ public class ProxyController {
     public void proxy(HttpServletRequest req, HttpServletResponse resp) throws Exception {
         long started = System.currentTimeMillis();
         // 步骤 1：缓冲请求体。CLI 的请求体是一段完整 JSON，整体读入最简单。
-        byte[] reqBody = req.getInputStream().readAllBytes();
+        byte[] reqBody = readAll(req.getInputStream());
 
         // 步骤 2：按路径选真实上游与 wire 格式。路径即可判断来源：
         //   /v1/messages == Claude Code（Anthropic）；
@@ -121,7 +126,8 @@ public class ProxyController {
 
         InputStream upstream = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
         if (upstream == null) {
-            upstream = InputStream.nullInputStream();
+            // 空流（兼容 JDK 8；InputStream.nullInputStream() 是 Java 11 才有）。
+            upstream = new ByteArrayInputStream(new byte[0]);
         }
 
         StreamAggregator agg = sse ? parser.newAggregator() : null;
@@ -156,7 +162,8 @@ public class ProxyController {
                 sseParser.flush();   // 冲出缓冲区里残留的最后一个事件
                 ex.response = agg.result();
             } else {
-                ex.response = parser.parseResponse(copy.toString(StandardCharsets.UTF_8));
+                // ByteArrayOutputStream.toString(Charset) 是 Java 10+；用 toByteArray + new String 兼容 JDK 8。
+                ex.response = parser.parseResponse(new String(copy.toByteArray(), StandardCharsets.UTF_8));
             }
         } catch (Exception e) {
             NormalizedResponse r = new NormalizedResponse();
@@ -165,6 +172,17 @@ public class ProxyController {
         }
         ex.durationMs = System.currentTimeMillis() - started;
         recorder.record(ex);
+    }
+
+    // 整流读入为字节数组（兼容 JDK 8；InputStream.readAllBytes() 是 Java 9 才有）。
+    private static byte[] readAll(InputStream in) throws java.io.IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) != -1) {
+            out.write(buf, 0, n);
+        }
+        return out.toByteArray();
     }
 
     // 落盘前对凭证脱敏：转发给上游的仍是真实 key，只有写入日志的副本被打码，
