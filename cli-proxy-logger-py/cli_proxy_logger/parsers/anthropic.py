@@ -81,6 +81,11 @@ def parse_response(body):
 
 
 def create_stream_aggregator():
+    # Anthropic streams a response as a sequence of indexed "content blocks".
+    # A block is either text or a tool_use, and its payload arrives in pieces.
+    # We therefore key everything by the block `index`: open a block on
+    # content_block_start, append its fragments on content_block_delta, and
+    # finalize it on content_block_stop.
     res = empty_response()
     blocks = {}  # index -> { type, name, id, argText }
 
@@ -90,21 +95,29 @@ def create_stream_aggregator():
         if not data:
             return
         if type_ == "message_start":
+            # First event of the stream; carries the initial usage counters.
             msg = data.get("message") or {}
             if msg.get("usage"):
                 res["usage"] = msg["usage"]
         elif type_ == "content_block_start":
+            # A new block opens. For a tool_use we already know id+name here;
+            # the arguments JSON will stream in later as partial_json fragments.
             cb = data.get("content_block") or {}
             blocks[data.get("index")] = {"type": cb.get("type"), "name": cb.get("name"),
                                           "id": cb.get("id"), "argText": ""}
         elif type_ == "content_block_delta":
+            # Incremental payload for an open block.
             b = blocks.get(data.get("index"))
             d = data.get("delta") or {}
             if d.get("type") == "text_delta":
-                res["text"] += d.get("text") or ""
+                res["text"] += d.get("text") or ""  # assistant prose, char by char
             elif d.get("type") == "input_json_delta" and b:
+                # Tool arguments arrive as a JSON STRING split into fragments;
+                # we just concatenate them and json-parse once the block ends.
                 b["argText"] += d.get("partial_json") or ""
         elif type_ == "content_block_stop":
+            # Block complete. If it was a tool call, the accumulated argText is
+            # now a full JSON object -> parse it into the final ToolCall.
             b = blocks.get(data.get("index"))
             if b and b.get("type") == "tool_use":
                 res["toolCalls"].append({"id": b.get("id"), "name": b.get("name"),

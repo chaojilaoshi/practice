@@ -22,6 +22,10 @@ from .parsers import PARSERS
 from .sse import SSEParser
 from .upstream import resolve_upstream
 
+# "Hop-by-hop" headers are meaningful only for a single transport connection
+# (per RFC 7230 6.1) and must NOT be blindly relayed by a proxy. We also drop
+# host/content-length here because we always recompute them for the new
+# connection, and transfer-encoding because we re-frame the body ourselves.
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length",
@@ -29,11 +33,17 @@ HOP_BY_HOP = {
 
 
 def _redact_headers(headers, redact):
+    """Mask credentials before they are written to disk. The *real* key is still
+    forwarded to the upstream untouched -- only the logged copy is redacted, so
+    your JSONL files never contain a usable API key.
+    """
     out = {}
     for k, v in headers:
         lk = k.lower()
         if redact and lk in ("authorization", "x-api-key", "api-key"):
             s = str(v)
+            # Keep a short prefix/suffix so you can tell two keys apart in logs
+            # without exposing the secret (e.g. "Bearer...7912").
             out[k] = "***" if len(s) <= 12 else f"{s[:6]}...{s[-4:]}"
         else:
             out[k] = v
@@ -89,9 +99,17 @@ def _make_handler(config, recorder):
 
         def _handle(self):
             started = datetime.now(timezone.utc)
+
+            # --- Step 1: buffer the request body -----------------------------
+            # CLI requests are a single complete JSON document, so reading the
+            # whole Content-Length up front is simplest. (A general-purpose
+            # proxy would stream this too, but here it keeps the code readable.)
             length = int(self.headers.get("content-length") or 0)
             req_body = self.rfile.read(length) if length else b""
 
+            # --- Step 2: pick the real upstream + wire format ----------------
+            # The path alone tells us who the client is: /v1/messages == Claude
+            # Code (Anthropic), /v1/responses or /v1/chat/completions == Codex.
             lower_headers = {k.lower(): v for k, v in self.headers.items()}
             info = resolve_upstream(config, self.path, lower_headers)
             wire = info["wire"]
@@ -104,6 +122,11 @@ def _make_handler(config, recorder):
             netloc = split.netloc
             upstream_url = f"{scheme}://{netloc}{self.path}"
 
+            # --- Step 3: build the upstream request headers ------------------
+            # Copy the client's headers through verbatim (including the real
+            # Authorization / x-api-key) so the upstream sees an identical
+            # request -- this is why CLI-specific gating (e.g. cc.freemodel.dev
+            # only answering real Claude Code headers) still works through us.
             out_headers = {}
             for k, v in self.headers.items():
                 lk = k.lower()
@@ -122,6 +145,9 @@ def _make_handler(config, recorder):
             if req_body:
                 out_headers["Content-Length"] = str(len(req_body))
 
+            # Parse the request body now (it is plain JSON) into the normalized
+            # shape. Wrapped in try/except: a parse bug must never stop us from
+            # forwarding the request to the upstream.
             try:
                 parsed_request = parser.parse_request(req_body.decode("utf-8", "replace"))
             except Exception:
@@ -144,6 +170,10 @@ def _make_handler(config, recorder):
                 "error": None,
             }
 
+            # --- Step 4: open the upstream connection and send the request ---
+            # http.client is the stdlib's low-level HTTP/1.1 client. Unlike
+            # urllib it lets us stream the response with .read(n), which is what
+            # we need to relay an SSE stream chunk-by-chunk.
             if scheme == "https":
                 conn = http.client.HTTPSConnection(host, port, timeout=600)
             else:
@@ -173,8 +203,12 @@ def _make_handler(config, recorder):
             is_sse = "text/event-stream" in content_type
             content_encoding = upstream_res.getheader("content-encoding")
 
-            # Forward status + headers to the client, dropping framing headers so
-            # we can re-frame ourselves and never desync the client's parser.
+            # --- Step 5: relay status + headers back to the client -----------
+            # We forward the upstream's status line and headers, minus the
+            # framing headers (transfer-encoding/content-length). Because we set
+            # "Connection: close", the response body is delimited by EOF -- a
+            # valid HTTP/1.1 framing that avoids re-implementing chunked
+            # encoding and never desyncs the client's parser.
             self.send_response_only(upstream_res.status, upstream_res.reason)
             for k, v in res_header_pairs:
                 if k.lower() in HOP_BY_HOP:
@@ -184,11 +218,19 @@ def _make_handler(config, recorder):
             self.end_headers()
             self.close_connection = True
 
+            # --- Step 6: stream the body two ways at once --------------------
+            # For an SSE response we run an incremental SSE parser whose events
+            # feed a per-wire "aggregator" that rebuilds text + tool calls. For
+            # a plain JSON response we just buffer the decoded bytes and parse
+            # once at the end.
             sse = SSEParser() if is_sse else None
             agg = parser.create_stream_aggregator() if is_sse else None
             if sse:
                 sse.on("event", lambda e: agg["feed"](e))
 
+            # The bytes on the wire may be gzip/deflate-compressed; this decoder
+            # incrementally decompresses the COPY we parse. The bytes forwarded
+            # to the client are never touched.
             decode = _make_stream_decoder(content_encoding)
             raw_copy = bytearray()
 
@@ -200,6 +242,11 @@ def _make_handler(config, recorder):
                 elif len(raw_copy) < config["maxBodyBytes"]:
                     raw_copy.extend(buf)
 
+            # The core dual-path loop. Read a chunk from the upstream, write the
+            # ORIGINAL bytes to the client first (fidelity: the CLI must be
+            # unaffected even if our parser later throws), then tee a decoded
+            # copy into the parser. If the client hangs up we keep draining the
+            # upstream so the exchange is still fully logged.
             client_alive = True
             while True:
                 chunk = upstream_res.read(65536)
@@ -207,15 +254,16 @@ def _make_handler(config, recorder):
                     break
                 if client_alive:
                     try:
-                        self.wfile.write(chunk)  # fidelity: forward raw bytes first
-                        self.wfile.flush()
+                        self.wfile.write(chunk)  # forward raw bytes FIRST
+                        self.wfile.flush()       # flush so SSE arrives live
                     except (BrokenPipeError, ConnectionError, OSError):
                         client_alive = False
                 on_decoded(decode(chunk))  # tee a decoded COPY into the parser
 
+            # --- Step 7: finalize the normalized response --------------------
             try:
                 if sse:
-                    sse.flush()
+                    sse.flush()  # emit any trailing event still in the buffer
                     exchange["response"] = agg["result"]()
                 else:
                     exchange["response"] = parser.parse_response(bytes(raw_copy).decode("utf-8", "replace"))
@@ -227,7 +275,8 @@ def _make_handler(config, recorder):
             recorder.record(exchange)
             conn.close()
 
-        # Dispatch every HTTP method through the same handler.
+        # BaseHTTPRequestHandler dispatches by method name (do_GET, do_POST,
+        # ...). We proxy every verb identically, so point them all at _handle.
         do_GET = _handle
         do_POST = _handle
         do_PUT = _handle

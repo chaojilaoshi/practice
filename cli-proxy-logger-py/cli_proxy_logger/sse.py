@@ -26,11 +26,18 @@ class SSEParser:
                 pass
 
     def push(self, text):
+        # Append the new text and try to peel off complete events. Because the
+        # network delivers arbitrary byte boundaries, an event may be split
+        # across two push() calls -- so we always retain the trailing, possibly
+        # incomplete, fragment in self._buf for next time. This is the essence
+        # of "incremental" parsing: never assume a chunk ends on an event
+        # boundary.
         self._buf += text
         # SSE events are separated by a blank line. Handle \n\n and \r\n\r\n.
         normalized = self._buf.replace("\r\n", "\n")
         parts = normalized.split("\n\n")
-        # Keep the last (possibly incomplete) chunk in the buffer.
+        # The last element is whatever came after the final blank line; it may
+        # be a partial event, so put it back in the buffer.
         self._buf = parts.pop() if parts else ""
         for block in parts:
             if block.strip() == "":

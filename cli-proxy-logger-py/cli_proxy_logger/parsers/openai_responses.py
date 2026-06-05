@@ -80,6 +80,10 @@ def parse_response(body):
 
 
 def create_stream_aggregator():
+    # The Responses API streams "semantic" events that already name what is
+    # happening (response.output_item.added, ...function_call_arguments.delta,
+    # ...). Each output item has a stable `item_id`, so we accumulate tool-call
+    # arguments per item_id and emit the ToolCall when the item is done.
     res = empty_response()
     calls = {}  # item_id -> { id, name, argText }
 
@@ -87,22 +91,28 @@ def create_stream_aggregator():
         data = safe_json_parse(evt.get("data"))
         if not data:
             return
+        # Event name may be on the SSE "event:" line or inside the JSON.
         type_ = evt.get("event") or data.get("type")
         if type_ == "response.output_item.added":
+            # A new output item appears; remember it if it's a function call.
             item = data.get("item") or {}
             if item.get("type") == "function_call":
                 key = item.get("id") or data.get("item_id")
                 calls[key] = {"id": item.get("call_id") or item.get("id"),
                               "name": item.get("name"), "argText": ""}
         elif type_ == "response.function_call_arguments.delta":
+            # Argument JSON streams in as fragments -> concatenate by item_id.
             c = calls.get(data.get("item_id"))
             if c:
                 c["argText"] += data.get("delta") or ""
         elif type_ == "response.function_call_arguments.done":
+            # Some servers send the full arguments here instead of deltas; only
+            # use it as a fallback when we never received any delta fragments.
             c = calls.get(data.get("item_id"))
             if c and data.get("arguments") is not None and c["argText"] == "":
                 c["argText"] = data["arguments"]
         elif type_ == "response.output_item.done":
+            # Item finished -> finalize the tool call (parse accumulated args).
             item = data.get("item") or {}
             if item.get("type") == "function_call":
                 key = item.get("id") or data.get("item_id")

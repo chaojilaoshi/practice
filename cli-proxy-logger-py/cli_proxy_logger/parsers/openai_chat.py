@@ -65,6 +65,12 @@ def parse_response(body):
 
 
 def create_stream_aggregator():
+    # Chat Completions streams "chunks" whose choices[].delta carries partial
+    # content. Unlike the Responses API there is no per-tool event: a tool call
+    # is split across many chunks and identified only by its position via
+    # tool_calls[].index. So we accumulate name+arguments per `index`, and the
+    # first chunk for a given index carries the id+name while the rest carry
+    # argument fragments. [DONE] is the stream terminator sentinel, not JSON.
     res = empty_response()
     calls = {}  # index -> { id, name, argText }
 
