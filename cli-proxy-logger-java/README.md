@@ -137,6 +137,37 @@ PROXY_OPENAI_UPSTREAM=https://api.freemodel.dev PROXY_ANTHROPIC_UPSTREAM=https:/
 | `proxy.redact-auth` | `true` | 落盘时脱敏 `x-api-key`/`authorization` |
 | `proxy.max-body-bytes` | `2000000` | 单条 body 落盘上限 |
 
+## 内网打包与部署（离线）
+
+Java 版与 Node/Python 不同：它**有第三方依赖**（Spring Boot、内嵌 Tomcat、Jackson），内网机器无法从 Maven 中央仓库下载。所以**核心思路是：在能联网的机器上打成 fat jar（所有依赖打进单个 jar），再把 jar 拷到内网用 JRE 直接跑**。
+
+**步骤**
+1. **在联网机器构建 fat jar**（首次会从中央仓库拉依赖，所以必须联网）：
+   ```bash
+   cd cli-proxy-logger-java
+   mvn -DskipTests package
+   ```
+   产物：`target/cli-proxy-logger-1.0.0.jar`（本机实测约 **17 MB**，**已内嵌 Spring + Tomcat + Jackson + 本工程的静态 UI**，是一个自包含可执行 jar；`spring-boot-maven-plugin` 的 repackage 会自动做这件事）。
+2. **准备 JRE**：内网机器装 **JRE/JDK 17**（与 `pom.xml` 的 `java.version=17` 一致）。可用各厂商的离线包（Temurin/Adoptium、Zulu、Microsoft OpenJDK 等）。**不需要 Maven、不需要源码**——只要这一个 jar + JRE。
+3. **拷贝并运行**：把 `cli-proxy-logger-1.0.0.jar` 拷到内网，运行：
+   ```bash
+   java -jar cli-proxy-logger-1.0.0.jar
+   # 改端口 / 上游（命令行参数）：
+   java -jar cli-proxy-logger-1.0.0.jar --server.port=8788 \
+        --proxy.openai-upstream=https://内网网关/v1上游 \
+        --proxy.anthropic-upstream=https://内网网关/anthropic上游 \
+        --proxy.log-dir=/var/log/cli-proxy
+   # 或用环境变量：PROXY_OPENAI_UPSTREAM / PROXY_ANTHROPIC_UPSTREAM / PROXY_LOG_DIR / SERVER_PORT
+   ```
+   也可在 jar 同级目录放一个 `application.yml`（或 `./config/application.yml`），Spring Boot 启动时会自动加载并覆盖内置配置——内网改配置不用重新打包。
+4. **常驻后台**（可选）：
+   - Linux：写 systemd service（`ExecStart=/path/to/java -jar /opt/cli-proxy/cli-proxy-logger-1.0.0.jar`），或 `nohup java -jar ... &`。
+   - Windows：用 `nssm` 把 `java -jar ...` 注册成 Windows 服务，或任务计划程序开机启动。
+
+**如果必须在内网用 Maven 构建**（不推荐，麻烦）：在联网机器用 `mvn -DskipTests package dependency:go-offline` 预热本地仓库 `~/.m2/repository`，把整个 `.m2/repository` 拷到内网同路径，再用 `mvn -o package` 离线构建。直接拷 fat jar 更省事。
+
+> **网络/安全**：代理 + UI 共用一个端口（默认 `:8788`）。CLI 的 base URL 指向 `127.0.0.1`，**建议与 CLI 同机部署**。Spring Boot/Tomcat 默认会监听所有网卡，若只想本机可访问，加 `--server.address=127.0.0.1`，避免端口暴露到内网其他机器。
+
 ## 代码结构（控制/数据流顺序）
 
 | 类 | 职责 |

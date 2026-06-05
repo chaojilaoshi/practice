@@ -142,6 +142,28 @@ OPENAI_UPSTREAM=https://api.freemodel.dev ANTHROPIC_UPSTREAM=https://cc.freemode
 | `OPENAI_UPSTREAM` | `https://api.openai.com` | OpenAI 上游 |
 | `MAX_BODY_BYTES` | `2000000` | 单条 body 落盘上限，超出截断 |
 
+## 内网打包与部署（离线）
+
+本工具**零第三方依赖**（只用 Node 内置模块），所以内网部署很简单：把目录拷进去 + 装好 Node 运行时即可，**不需要 `npm install`、不需要联网**。
+
+**步骤（推荐：拷目录 + 离线 Node 运行时）**
+1. **准备 Node 运行时离线包**：在能联网的机器上从 nodejs.org 下载与内网 OS 匹配的免安装包（Windows 用 `node-v20.x.x-win-x64.zip`，Linux 用 `node-v20.x.x-linux-x64.tar.xz`），拷进内网解压，把其中的 `node`（Windows 是 `node.exe`）所在目录加入 `PATH`。要求 **Node >= 18**（本机实测 v20.19.0）。
+2. **打包工程**：直接把整个 `cli-proxy-logger/` 目录打成 zip 拷过去即可（包含 `src/`、`public/`、`package.json`）。**没有 `node_modules`**，因为本项目无第三方依赖。
+3. **运行**：
+   ```bash
+   cd cli-proxy-logger
+   node src/index.js            # 等价于 npm start
+   ```
+   按需设置环境变量（同一条命令前缀，或先 export/set）：`PROXY_PORT` / `UI_PORT` / `LOG_DIR` / `OPENAI_UPSTREAM` / `ANTHROPIC_UPSTREAM`。
+4. **常驻后台**（可选）：
+   - Linux：`nohup node src/index.js > proxy.out 2>&1 &`，或写一个 systemd service。
+   - Windows：用 `nssm` 注册成服务，或「任务计划程序」开机启动，或 `start /b node src/index.js`。
+
+**可选（进阶）：单文件可执行**
+Node 20 支持 SEA（Single Executable Applications）把脚本+运行时打成一个 exe，免在内网装 Node；或用 `pkg`/`nexe`。这条本仓库未内置脚本，按需自行打包。
+
+> **网络/安全**：代理与 UI 默认监听本机端口（proxy `:8788`、UI `:8789`）。由于 CLI 的 base URL 指向 `127.0.0.1`，**代理需与 CLI 部署在同一台机器**。不要把这两个端口暴露到内网其他机器（鉴权头虽落盘脱敏，但内存/转发链路上是明文）。
+
 ## 工作原理（三种 wire 格式的工具调用解析点）
 
 | wire | 触发 CLI | 请求路径 | 工具调用解析点 |

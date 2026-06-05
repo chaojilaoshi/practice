@@ -151,6 +151,32 @@ OPENAI_UPSTREAM=https://api.freemodel.dev ANTHROPIC_UPSTREAM=https://cc.freemode
 | `OPENAI_UPSTREAM` | `https://api.openai.com` | OpenAI 上游 |
 | `MAX_BODY_BYTES` | `2000000` | 单条 body 落盘上限，超出截断 |
 
+## 内网打包与部署（离线）
+
+本版本**纯 Python 标准库、零第三方依赖**（不需要 `pip install`），内网部署只需：拷目录 + 装好 Python 运行时。
+
+**步骤（推荐：拷目录 + 内网 Python 运行时）**
+1. **准备 Python 运行时**：内网机器装 **CPython 3.8+**（本机实测 3.12.8）。可用官方离线安装包（Windows `.exe`/嵌入式 zip、各 Linux 发行版的系统包），或 Windows 免安装的 embeddable 包。**无需 pip 安装任何包**。
+2. **打包工程**：把整个 `cli-proxy-logger-py/` 目录打成 zip 拷过去（包含 `cli_proxy_logger/`、`public/`）。无 `requirements.txt`、无虚拟环境需求。
+3. **运行**：
+   ```bash
+   cd cli-proxy-logger-py
+   python -m cli_proxy_logger
+   ```
+   按需设置环境变量：`PROXY_PORT` / `UI_PORT` / `LOG_DIR` / `OPENAI_UPSTREAM` / `ANTHROPIC_UPSTREAM`。
+   - **若 `-m` 报 `No module named cli_proxy_logger`**（某些 Windows embeddable / 嵌入式 Python 会忽略 cwd/`PYTHONPATH`），用等价的回退命令：
+     ```bash
+     python -c "import sys; sys.path.insert(0,'.'); from cli_proxy_logger.__main__ import main; main()"
+     ```
+4. **常驻后台**（可选）：
+   - Linux：`nohup python -m cli_proxy_logger > proxy.out 2>&1 &`，或 systemd service。
+   - Windows：`nssm` 注册服务、任务计划程序，或 `start /b python -m cli_proxy_logger`。
+
+**可选（进阶）：单文件可执行**
+用 PyInstaller（`pyinstaller -F -n cli-proxy-logger cli_proxy_logger/__main__.py`，记得用 `--add-data` 带上 `public/`）在**与内网相同 OS 的联网机器**上打成单 exe 再拷过去，免在内网装 Python。本仓库未内置打包脚本，按需自行打包。
+
+> **网络/安全**：代理与 UI 默认监听本机端口（proxy `:8788`、UI `:8789`）。CLI 的 base URL 指向 `127.0.0.1`，**代理需与 CLI 部署在同一台机器**；不要把端口暴露到内网其他机器。
+
 ## 工作原理（三种 wire 格式的工具调用解析点）
 
 | wire | 触发 CLI | 请求路径 | 工具调用解析点 |
