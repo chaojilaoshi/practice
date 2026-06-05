@@ -29,72 +29,106 @@ npm start
 
 打开 http://127.0.0.1:8789 浏览抓到的请求。
 
-## 接入 Claude Code
+## 使用配置模板（Codex / Claude Code / opencode）
 
-```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
-# 指向非官方 host 时 MCP tool search 默认关闭，需要可开启：
-# export ENABLE_TOOL_SEARCH=true
-claude
-```
+启动代理后（见上方「运行」），把各 CLI 的 base URL 指向本地代理即可。**最关键的区别：Codex / opencode 的 base URL 带 `/v1`；Claude Code 的不带 `/v1`**（它自己会拼 `/v1/messages`，带了会变成 `/v1/v1/messages` 而 404）。
 
-Claude Code 走 Anthropic Messages 格式：`POST /v1/messages`（流式 SSE）。
+代理按路径区分上游：`/v1/responses` 与 `/v1/chat/completions` 走 `OPENAI_UPSTREAM`，`/v1/messages` 走 `ANTHROPIC_UPSTREAM`。启动代理时按需设置这两个上游（见本节末「启动代理时设置上游」）。
 
-## 接入 Codex
+### Codex（`~/.codex/config.toml`）
 
-编辑 `~/.codex/config.toml`：
-
-```toml
-# 方式一：直接改内置 openai provider 的 base URL
-openai_base_url = "http://127.0.0.1:8788/v1"
-```
-
-或定义一个自定义 provider：
-
+**场景 A：自定义 provider（推荐，可与官方 OpenAI 配置共存）**
 ```toml
 model = "gpt-5"
 model_provider = "proxy"
 
 [model_providers.proxy]
-name = "local proxy"
+name = "local proxy"            # 必填，否则报 "provider name must not be empty"
 base_url = "http://127.0.0.1:8788/v1"
-env_key = "OPENAI_API_KEY"
-wire_api = "responses"   # Codex 默认；也可设 "chat"
+wire_api = "responses"          # Codex 默认走 Responses；兼容 API 可设 "chat"
+env_key = "OPENAI_API_KEY"      # key 走环境变量时需要；若用 auth.json 则删掉这行
 ```
 
-Codex 默认走 OpenAI Responses 格式：`POST /v1/responses`（流式）；chat 模式走 `POST /v1/chat/completions`。
+**场景 B：直接改内置 openai provider 的 base URL（最省事）**
+```toml
+openai_base_url = "http://127.0.0.1:8788/v1"
+```
 
-## 接入 opencode（已实测可用）
+**key 的两种提供方式（二选一）：**
+- 环境变量：provider 块保留 `env_key = "OPENAI_API_KEY"`，启动前设好 `set OPENAI_API_KEY=<key>`（PowerShell：`$env:OPENAI_API_KEY="<key>"`）。
+- `~/.codex/auth.json`：写 `{ "OPENAI_API_KEY": "<key>" }`，并**删掉** provider 块里的 `env_key`（否则 Codex 强制找环境变量，报 `Missing environment variable: OPENAI_API_KEY`）。
 
-opencode 也支持「每个 provider 自定义 `baseURL`」，底层走的就是本工具已支持的三种 wire 格式，所以**完全可以用这个代理拦截**。在 `opencode.json`（或 `~/.config/opencode/opencode.json`）里把 provider 的 `baseURL` 指到本地代理即可：
+**wire 区别：** `wire_api = "responses"` → `POST /v1/responses`（Codex 默认，流式）；`wire_api = "chat"` → `POST /v1/chat/completions`。
+
+### Claude Code（环境变量）
+
+```bash
+# base URL 不带 /v1！Claude Code 自己拼 /v1/messages
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
+export ANTHROPIC_API_KEY=<key>          # 以 x-api-key 头发出，代理原样转发、落盘脱敏
+# 指向非官方 host 时 MCP tool search 默认关闭，需要可开启：
+# export ENABLE_TOOL_SEARCH=true
+
+# 模型分三档：opus / sonnet / haiku。接第三方上游时建议显式指定，
+# 否则别名会解析成 Anthropic 官方模型名，上游不一定认。
+export ANTHROPIC_MODEL=<主模型>                       # 覆盖当前会话主模型
+export ANTHROPIC_DEFAULT_OPUS_MODEL=<opus 档模型>     # /model 切到 opus 时解析到的模型
+export ANTHROPIC_DEFAULT_SONNET_MODEL=<sonnet 档模型> # /model 切到 sonnet 时解析到的模型
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=<haiku 档模型>   # haiku 档 + 后台任务（标题/补全等）
+claude
+```
+Windows 用 `$env:NAME="..."`（PowerShell）或 `set NAME=...`（cmd）。
+
+模型说明：
+- `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL` 分别控制三档别名解析到的真实模型；`ANTHROPIC_MODEL` 覆盖「当前主模型」（优先级高于 `model` 设置）。
+- 旧版的 `ANTHROPIC_SMALL_FAST_MODEL` 已被 `ANTHROPIC_DEFAULT_HAIKU_MODEL` 取代（仍向后兼容，对应 haiku/后台档）。
+- **后台任务**（生成会话标题等）默认走 haiku 档，所以即便你只用 sonnet，也建议把 `ANTHROPIC_DEFAULT_HAIKU_MODEL` 指到一个上游可用的小模型，否则后台请求可能报错。
+- 实测（freemodel）：`ANTHROPIC_MODEL=claude-sonnet-4-6` + `ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001` 可用。
+
+Claude Code 走 Anthropic Messages 格式：`POST /v1/messages`（流式 SSE）。
+
+### opencode（`opencode.json` 或 `~/.config/opencode/opencode.json`）
+
+opencode 支持「每个 provider 自定义 `baseURL`」，底层就是本工具已覆盖的三种 wire 格式，base URL **带 `/v1`**。三种场景按 `npm` 包区分：
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    // OpenAI 兼容（/v1/chat/completions） -> 命中 chat wire
+    // 场景①：OpenAI 兼容 -> /v1/chat/completions -> chat wire
     "myproxy-chat": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "Local proxy (chat)",
-      "options": { "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "<your-key>" },
+      "options": { "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "<key>" },
       "models": { "gpt-5": { "name": "gpt-5 via proxy (chat)" } }
     },
-    // OpenAI Responses（/v1/responses） -> 命中 responses wire
+    // 场景②：OpenAI Responses -> /v1/responses -> responses wire
     "myproxy-resp": {
       "npm": "@ai-sdk/openai",
       "name": "Local proxy (responses)",
-      "options": { "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "<your-key>" },
+      "options": { "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "<key>" },
       "models": { "gpt-5": { "name": "gpt-5 via proxy (responses)" } }
     },
-    // Anthropic 模型（/v1/messages） -> 命中 anthropic wire（覆盖内置 anthropic 的 baseURL）
+    // 场景③：Anthropic 模型 -> /v1/messages -> anthropic wire（覆盖内置 anthropic 的 baseURL）
     "anthropic": {
-      "options": { "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "<your-key>" }
+      "options": { "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "<key>" }
     }
   }
 }
 ```
+跑：`opencode run -m myproxy-chat/gpt-5 "..."`（或 `myproxy-resp/...`、`anthropic/...`）。本工具实测：chat / responses 路径都抓到工具调用参数与请求/响应体；anthropic 路径也被正确路由落盘（若上游按 CLI 指纹放行——如只认 Claude Code——可能拒绝 opencode，属上游限制，与代理无关）。
 
-opencode 的 AI SDK client 会在 `baseURL` 后拼出 `/chat/completions`、`/responses` 或 `/messages`，正好命中代理按路径选 wire 的逻辑。本会话用 `opencode run -m <provider>/<model>` 实测：chat 与 responses 两条路径都成功抓到工具调用（如 `read`、`glob`）的参数与请求/响应体；anthropic 路径同样被正确路由并落盘（注意：若上游按特定 CLI 指纹放行——如只认 Claude Code——它可能拒绝 opencode，这属于上游限制，与代理无关）。
+### 启动代理时设置上游
+
+| 用到的 CLI | 上游环境变量（默认值） |
+|-----------|------------------------|
+| Codex、opencode（chat / responses） | `OPENAI_UPSTREAM`（`https://api.openai.com`） |
+| Claude Code、opencode（anthropic） | `ANTHROPIC_UPSTREAM`（`https://api.anthropic.com`） |
+
+例（指向 freemodel）：
+```bash
+OPENAI_UPSTREAM=https://api.freemodel.dev ANTHROPIC_UPSTREAM=https://cc.freemodel.dev npm start
+```
 
 ## 配置（环境变量）
 
