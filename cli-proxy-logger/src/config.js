@@ -35,6 +35,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseProviders } from './providers.js';
+import { parseFilters } from './filters.js';
+import { DEFAULT_TOOL_NAME_MAP } from './transform.js';
+import { createOutbound } from './outbound.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -97,6 +100,39 @@ function loadProviders() {
   return parseProviders(process.env.PROVIDERS);
 }
 
+function loadFilters() {
+  if (process.env.FILTERS_FILE) {
+    try {
+      return parseFilters(fs.readFileSync(process.env.FILTERS_FILE, 'utf8'));
+    } catch (err) {
+      console.error('[config] failed to read FILTERS_FILE:', err.message);
+    }
+  }
+  return parseFilters(process.env.FILTERS);
+}
+
+// Tool-name map: built-in special cases overlaid with user JSON (TOOL_NAME_MAP
+// inline or TOOL_NAME_MAP_FILE). Keys are case-sensitive; built-ins are lowercase.
+function loadToolNameMap() {
+  const map = { ...DEFAULT_TOOL_NAME_MAP };
+  let raw = process.env.TOOL_NAME_MAP;
+  if (process.env.TOOL_NAME_MAP_FILE) {
+    try {
+      raw = fs.readFileSync(process.env.TOOL_NAME_MAP_FILE, 'utf8');
+    } catch (err) {
+      console.error('[config] failed to read TOOL_NAME_MAP_FILE:', err.message);
+    }
+  }
+  if (raw && raw.trim().startsWith('{')) {
+    try {
+      Object.assign(map, JSON.parse(raw));
+    } catch {
+      /* ignore malformed map */
+    }
+  }
+  return map;
+}
+
 function parseStatuses(raw, fallback) {
   if (!raw || typeof raw !== 'string') return new Set(fallback);
   const out = new Set();
@@ -141,6 +177,27 @@ export function loadConfig(overrides = {}) {
       signature: process.env.RECTIFY_SIGNATURE !== '0',
       budget: process.env.RECTIFY_BUDGET !== '0',
     },
+    // Tool-name normalization (opt-in). When enabled, lowercase tool names are
+    // rewritten (default PascalCase + built-in map) on the request, and
+    // optionally on the response, plus array/object inputs serialized as strings
+    // are repaired. Affects Anthropic /v1/messages traffic only.
+    transform: {
+      toolName: {
+        enabled: boolEnv('TOOL_NAME_CASE'),
+        request: process.env.TOOL_NAME_REQUEST !== '0',
+        response: process.env.TOOL_NAME_RESPONSE !== '0',
+        repairInput: process.env.TOOL_NAME_REPAIR_INPUT !== '0',
+        map: loadToolNameMap(),
+      },
+    },
+    // Request filters/rules (opt-in): mutate outbound headers/body before send.
+    filters: loadFilters(),
+    // Outbound proxy (opt-in): route upstream connections via an HTTP/SOCKS5
+    // proxy. null when UPSTREAM_PROXY (or HTTPS_PROXY/HTTP_PROXY) is unset.
+    outbound: createOutbound(
+      process.env.UPSTREAM_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy
+      || process.env.HTTP_PROXY || process.env.http_proxy,
+    ),
     ...overrides,
   };
 }
