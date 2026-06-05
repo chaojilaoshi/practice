@@ -1,0 +1,17 @@
+{
+  "name": "cli-proxy-logger",
+  "version": "0.1.0",
+  "description": "Local reverse proxy that intercepts and logs Claude Code / Codex CLI requests (request/response/tool calls).",
+  "type": "module",
+  "bin": {
+    "cli-proxy-logger": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test/run.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
