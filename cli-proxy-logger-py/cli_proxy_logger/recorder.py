@@ -60,3 +60,12 @@ class Recorder:
                 if e.get("id") == ex_id:
                     return e
         return None
+
+    def clear(self):
+        # Clears the in-memory list (what the UI shows). The on-disk JSONL logs
+        # are left untouched — they are the durable audit trail. Returns how many
+        # in-memory entries were removed.
+        with self._lock:
+            n = len(self.recent)
+            self.recent = []
+        return n

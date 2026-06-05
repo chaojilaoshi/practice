@@ -1,7 +1,8 @@
 // Lightweight web UI + JSON API for browsing captured exchanges.
-//   GET /                      -> static index.html
-//   GET /api/exchanges         -> recent exchange summaries
-//   GET /api/exchanges/:id     -> full exchange detail
+//   GET    /                   -> static index.html
+//   GET    /api/exchanges      -> recent exchange summaries
+//   GET    /api/exchanges/:id  -> full exchange detail
+//   DELETE /api/exchanges      -> clear the in-memory list (one-click "清空")
 
 import http from 'node:http';
 import fs from 'node:fs';
@@ -23,6 +24,11 @@ export function startUi(config, recorder) {
     const p = url.pathname;
 
     if (p === '/api/exchanges') {
+      // DELETE empties the in-memory list (the UI's "清空" button). Disk logs stay.
+      if (req.method === 'DELETE') {
+        const cleared = recorder.clear();
+        return sendJson(res, 200, { cleared });
+      }
       const limit = Number.parseInt(url.searchParams.get('limit') || '100', 10);
       return sendJson(res, 200, recorder.list(limit));
     }

@@ -69,4 +69,14 @@ public class ExchangeRecorder {
         }
         return null;
     }
+
+    /**
+     * 清空内存中的记录列表（UI 的「清空」按钮）。磁盘上的 JSONL 日志保留——
+     * 那是持久审计记录。返回被清掉的条数。
+     */
+    public synchronized int clear() {
+        int n = recent.size();
+        recent.clear();
+        return n;
+    }
 }

@@ -43,6 +43,7 @@
   <h1>cli-proxy-logger <span class="muted">(py)</span></h1>
   <span class="muted" id="count"></span>
   <button id="refresh">refresh</button>
+  <button id="clear">清空</button>
   <label class="muted"><input type="checkbox" id="auto" checked /> auto</label>
 </header>
 <div id="main">
@@ -113,6 +114,13 @@ async function loadDetail(id){
 }
 
 document.getElementById('refresh').onclick = loadList;
+document.getElementById('clear').onclick = async () => {
+  if(!confirm('清空当前列表？（磁盘上的日志文件保留）')) return;
+  await fetch('/api/exchanges', { method:'DELETE' });
+  selected = null;
+  detailEl.innerHTML = '<div class="empty">Select a request on the left.</div>';
+  loadList();
+};
 setInterval(()=>{ if(document.getElementById('auto').checked) loadList(); }, 2000);
 loadList();
 </script>

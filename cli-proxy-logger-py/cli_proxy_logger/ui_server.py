@@ -1,8 +1,9 @@
 """Lightweight web UI + JSON API for browsing captured exchanges.
 
-    GET /                      -> static index.html
-    GET /api/exchanges         -> recent exchange summaries
-    GET /api/exchanges/:id     -> full exchange detail
+    GET    /                   -> static index.html
+    GET    /api/exchanges      -> recent exchange summaries
+    GET    /api/exchanges/:id  -> full exchange detail
+    DELETE /api/exchanges      -> clear the in-memory list (one-click "清空")
 """
 
 import json
@@ -28,6 +29,15 @@ def _make_handler(config, recorder):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def do_DELETE(self):
+            # DELETE /api/exchanges empties the in-memory list (UI 的「清空」按钮)。
+            # 磁盘上的 JSONL 日志保留。
+            parts = urlsplit(self.path)
+            if parts.path == "/api/exchanges":
+                cleared = recorder.clear()
+                return self._send_json(200, {"cleared": cleared})
+            return self._send_json(404, {"error": "not found"})
 
         def do_GET(self):
             parts = urlsplit(self.path)

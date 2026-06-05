@@ -47,4 +47,13 @@ export class Recorder {
   get(id) {
     return this.recent.find((e) => e.id === id) || null;
   }
+
+  // Clears the in-memory list (what the UI shows). The on-disk JSONL logs are
+  // left untouched — they are the durable audit trail. Returns how many
+  // in-memory entries were removed.
+  clear() {
+    const n = this.recent.length;
+    this.recent = [];
+    return n;
+  }
 }
