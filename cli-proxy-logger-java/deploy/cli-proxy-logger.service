@@ -1,0 +1,27 @@
+# systemd 服务模板（Java 版）。用法：
+#   1) 把 fat jar 拷到 /opt/cli-proxy-logger-java/cli-proxy-logger-1.0.0.jar
+#      （可选）把 application.yml 放在 jar 同级目录覆盖配置
+#   2) 按需改下面的 java 路径、端口/上游（命令行参数或 application.yml 二选一）
+#   3) sudo cp deploy/cli-proxy-logger.service /etc/systemd/system/cli-proxy-logger-java.service
+#   4) sudo systemctl daemon-reload && sudo systemctl enable --now cli-proxy-logger-java
+#   查看日志：journalctl -u cli-proxy-logger-java -f
+[Unit]
+Description=cli-proxy-logger (Java/Spring Boot) - local LLM proxy logger
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cli-proxy-logger-java
+# java 的绝对路径按实际改（which java）；JDK 8+ 均可。
+# 端口/上游也可改用 application.yml；这里演示用命令行参数覆盖。
+ExecStart=/usr/bin/java -jar /opt/cli-proxy-logger-java/cli-proxy-logger-1.0.0.jar \
+    --server.port=8788 \
+    --proxy.log-dir=/var/log/cli-proxy-logger \
+    --proxy.openai-upstream=https://api.openai.com \
+    --proxy.anthropic-upstream=https://api.anthropic.com
+Restart=on-failure
+RestartSec=2
+# User=cliproxy
+
+[Install]
+WantedBy=multi-user.target

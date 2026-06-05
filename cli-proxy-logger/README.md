@@ -148,16 +148,23 @@ OPENAI_UPSTREAM=https://api.freemodel.dev ANTHROPIC_UPSTREAM=https://cc.freemode
 
 **步骤（推荐：拷目录 + 离线 Node 运行时）**
 1. **准备 Node 运行时离线包**：在能联网的机器上从 nodejs.org 下载与内网 OS 匹配的免安装包（Windows 用 `node-v20.x.x-win-x64.zip`，Linux 用 `node-v20.x.x-linux-x64.tar.xz`），拷进内网解压，把其中的 `node`（Windows 是 `node.exe`）所在目录加入 `PATH`。要求 **Node >= 18**（本机实测 v20.19.0）。
-2. **打包工程**：直接把整个 `cli-proxy-logger/` 目录打成 zip 拷过去即可（包含 `src/`、`public/`、`package.json`）。**没有 `node_modules`**，因为本项目无第三方依赖。
+2. **打包工程**：用一键打包脚本生成离线包（只含 `src/`、`public/`、`package.json`、README，**没有 `node_modules`**，因为本项目无第三方依赖）：
+   ```bash
+   bash scripts/package.sh                # Linux/macOS → dist/cli-proxy-logger-node.tar.gz
+   # 或 Windows PowerShell：
+   powershell -ExecutionPolicy Bypass -File scripts\package.ps1   # → dist\cli-proxy-logger-node.zip
+   ```
+   把 `dist/` 里的压缩包拷进内网解压即可（也可以直接拷整个目录）。
 3. **运行**：
    ```bash
    cd cli-proxy-logger
    node src/index.js            # 等价于 npm start
    ```
    按需设置环境变量（同一条命令前缀，或先 export/set）：`PROXY_PORT` / `UI_PORT` / `LOG_DIR` / `OPENAI_UPSTREAM` / `ANTHROPIC_UPSTREAM`。
-4. **常驻后台**（可选）：
-   - Linux：`nohup node src/index.js > proxy.out 2>&1 &`，或写一个 systemd service。
-   - Windows：用 `nssm` 注册成服务，或「任务计划程序」开机启动，或 `start /b node src/index.js`。
+4. **常驻后台**（可选，仓库已带模板）：
+   - **Linux（systemd）**：用 <code>deploy/cli-proxy-logger.service</code> 模板——改好里面的路径/端口/上游，`sudo cp` 到 `/etc/systemd/system/`，再 `sudo systemctl enable --now cli-proxy-logger`。日志看 `journalctl -u cli-proxy-logger -f`。
+   - **Windows（nssm）**：用 <code>deploy/install-nssm.ps1</code>——装好 [nssm](https://nssm.cc/) 后，以管理员 PowerShell 运行该脚本即可注册成开机自启服务（卸载：`nssm remove cli-proxy-logger confirm`）。
+   - 临时跑也行：Linux `nohup node src/index.js > proxy.out 2>&1 &`；Windows `start /b node src/index.js`。
 
 **可选（进阶）：单文件可执行**
 Node 20 支持 SEA（Single Executable Applications）把脚本+运行时打成一个 exe，免在内网装 Node；或用 `pkg`/`nexe`。这条本仓库未内置脚本，按需自行打包。

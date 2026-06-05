@@ -157,7 +157,13 @@ OPENAI_UPSTREAM=https://api.freemodel.dev ANTHROPIC_UPSTREAM=https://cc.freemode
 
 **步骤（推荐：拷目录 + 内网 Python 运行时）**
 1. **准备 Python 运行时**：内网机器装 **CPython 3.8+**（本机实测 3.12.8）。可用官方离线安装包（Windows `.exe`/嵌入式 zip、各 Linux 发行版的系统包），或 Windows 免安装的 embeddable 包。**无需 pip 安装任何包**。
-2. **打包工程**：把整个 `cli-proxy-logger-py/` 目录打成 zip 拷过去（包含 `cli_proxy_logger/`、`public/`）。无 `requirements.txt`、无虚拟环境需求。
+2. **打包工程**：用一键打包脚本生成离线包（只含 `cli_proxy_logger/`、`public/`、README，自动剔除 `__pycache__`；无 `requirements.txt`、无虚拟环境需求）：
+   ```bash
+   bash scripts/package.sh                # Linux/macOS → dist/cli-proxy-logger-py.tar.gz
+   # 或 Windows PowerShell：
+   powershell -ExecutionPolicy Bypass -File scripts\package.ps1   # → dist\cli-proxy-logger-py.zip
+   ```
+   把 `dist/` 里的压缩包拷进内网解压即可（也可以直接拷整个目录）。
 3. **运行**：
    ```bash
    cd cli-proxy-logger-py
@@ -168,9 +174,10 @@ OPENAI_UPSTREAM=https://api.freemodel.dev ANTHROPIC_UPSTREAM=https://cc.freemode
      ```bash
      python -c "import sys; sys.path.insert(0,'.'); from cli_proxy_logger.__main__ import main; main()"
      ```
-4. **常驻后台**（可选）：
-   - Linux：`nohup python -m cli_proxy_logger > proxy.out 2>&1 &`，或 systemd service。
-   - Windows：`nssm` 注册服务、任务计划程序，或 `start /b python -m cli_proxy_logger`。
+4. **常驻后台**（可选，仓库已带模板）：
+   - **Linux（systemd）**：用 <code>deploy/cli-proxy-logger.service</code> 模板——改好路径/端口/上游，`sudo cp` 到 `/etc/systemd/system/cli-proxy-logger-py.service`，再 `sudo systemctl enable --now cli-proxy-logger-py`。日志看 `journalctl -u cli-proxy-logger-py -f`。
+   - **Windows（nssm）**：用 <code>deploy/install-nssm.ps1</code>——装好 [nssm](https://nssm.cc/) 后以管理员 PowerShell 运行即可注册成开机自启服务（卸载：`nssm remove cli-proxy-logger-py confirm`）。
+   - 临时跑也行：Linux `nohup python -m cli_proxy_logger > proxy.out 2>&1 &`；Windows `start /b python -m cli_proxy_logger`。
 
 **可选（进阶）：单文件可执行**
 用 PyInstaller（`pyinstaller -F -n cli-proxy-logger cli_proxy_logger/__main__.py`，记得用 `--add-data` 带上 `public/`）在**与内网相同 OS 的联网机器**上打成单 exe 再拷过去，免在内网装 Python。本仓库未内置打包脚本，按需自行打包。

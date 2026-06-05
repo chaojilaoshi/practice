@@ -144,12 +144,14 @@ PROXY_OPENAI_UPSTREAM=https://api.freemodel.dev PROXY_ANTHROPIC_UPSTREAM=https:/
 Java 版与 Node/Python 不同：它**有第三方依赖**（Spring Boot、内嵌 Tomcat、Jackson），内网机器无法从 Maven 中央仓库下载。所以**核心思路是：在能联网的机器上打成 fat jar（所有依赖打进单个 jar），再把 jar 拷到内网用 JRE 直接跑**。
 
 **步骤**
-1. **在联网机器构建 fat jar**（首次会从中央仓库拉依赖，所以必须联网）：
+1. **在联网机器构建 fat jar**（首次会从中央仓库拉依赖，所以必须联网）。可用一键打包脚本（会 `mvn package` 并把 jar + 样例 `application.yml` 放进 `dist/`）：
    ```bash
-   cd cli-proxy-logger-java
-   mvn -DskipTests package
+   bash scripts/package.sh                # Linux/macOS
+   # 或 Windows PowerShell：
+   powershell -ExecutionPolicy Bypass -File scripts\package.ps1
+   # 也可以手动：mvn -DskipTests package
    ```
-   产物：`target/cli-proxy-logger-1.0.0.jar`（本机实测约 **17 MB**，**已内嵌 Spring + Tomcat + Jackson + 本工程的静态 UI**，是一个自包含可执行 jar；`spring-boot-maven-plugin` 的 repackage 会自动做这件事）。
+   产物：`target/cli-proxy-logger-1.0.0.jar`（脚本会再拷一份到 `dist/`），本机实测约 **17 MB**，**已内嵌 Spring + Tomcat + Jackson + 本工程的静态 UI**，是一个自包含可执行 jar（`spring-boot-maven-plugin` 的 repackage 会自动做这件事）。
 2. **准备 JRE**：内网机器装 **JRE/JDK 8 及以上**（本工程默认 `java.version=8`，所以 JDK 8 即可；11/17 也行）。可用各厂商的离线包（Temurin/Adoptium、Zulu、Microsoft OpenJDK 等）。**不需要 Maven、不需要源码**——只要这一个 jar + JRE。注意：构建机的 JDK 版本要 **≥ 你设定的 `java.version`**（用 JDK 8 构建则产出 Java 8 字节码，能在 8/11/17 上跑；用 JDK 17 构建且 `java.version=8` 也能产出 Java 8 字节码）。
 3. **拷贝并运行**：把 `cli-proxy-logger-1.0.0.jar` 拷到内网，运行：
    ```bash
@@ -162,9 +164,12 @@ Java 版与 Node/Python 不同：它**有第三方依赖**（Spring Boot、内�
    # 或用环境变量：PROXY_OPENAI_UPSTREAM / PROXY_ANTHROPIC_UPSTREAM / PROXY_LOG_DIR / SERVER_PORT
    ```
    也可在 jar 同级目录放一个 `application.yml`（或 `./config/application.yml`），Spring Boot 启动时会自动加载并覆盖内置配置——内网改配置不用重新打包。
-4. **常驻后台**（可选）：
-   - Linux：写 systemd service（`ExecStart=/path/to/java -jar /opt/cli-proxy/cli-proxy-logger-1.0.0.jar`），或 `nohup java -jar ... &`。
-   - Windows：用 `nssm` 把 `java -jar ...` 注册成 Windows 服务，或任务计划程序开机启动。
+4. **常驻后台**（可选，仓库已带模板）：
+   - **Linux（systemd）**：用 <code>deploy/cli-proxy-logger.service</code> 模板——把 jar 放到 `/opt/cli-proxy-logger-java/`，改好里面的 java 路径/端口/上游，`sudo cp` 到 `/etc/systemd/system/cli-proxy-logger-java.service`，再 `sudo systemctl enable --now cli-proxy-logger-java`。日志看 `journalctl -u cli-proxy-logger-java -f`。
+   - **Windows（nssm）**：用 <code>deploy/install-nssm.ps1</code>——装好 [nssm](https://nssm.cc/) 后以管理员 PowerShell 运行即可注册成开机自启服务（卸载：`nssm remove cli-proxy-logger-java confirm`）。
+   - 临时跑也行：Linux `nohup java -jar ... &`。
+
+> 仓库还附了 <code>deploy/application.yml.sample</code>（改名为 `application.yml` 放在 jar 同级目录即可覆盖配置，无需重新打包）。
 
 **如果必须在内网用 Maven 构建**（不推荐，麻烦）：在联网机器用 `mvn -DskipTests package dependency:go-offline` 预热本地仓库 `~/.m2/repository`，把整个 `.m2/repository` 拷到内网同路径，再用 `mvn -o package` 离线构建。直接拷 fat jar 更省事。
 
