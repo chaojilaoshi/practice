@@ -19,6 +19,9 @@ import * as anthropic from './parsers/anthropic.js';
 import * as openaiResponses from './parsers/openaiResponses.js';
 import * as openaiChat from './parsers/openaiChat.js';
 import { safeJsonParse } from './model.js';
+import { BreakerRegistry } from './breaker.js';
+import { resolveCandidates, wireToGroup } from './providers.js';
+import { detectRectification, applyRectification } from './rectifier.js';
 import {
   anthropicRequestToChat,
   chatResponseToAnthropic,
@@ -90,15 +93,19 @@ function truncate(buf, max) {
 }
 
 export function startProxy(config, recorder) {
+  // One breaker registry per proxy instance, shared across all requests so
+  // failure state for a provider persists between requests.
+  const breakers = new BreakerRegistry(config.breaker || {});
   const server = http.createServer((clientReq, clientRes) => {
     const chunks = [];
     clientReq.on('data', (c) => chunks.push(c));
     clientReq.on('end', () => {
       const reqBodyBuf = Buffer.concat(chunks);
-      handleRequest(config, recorder, clientReq, clientRes, reqBodyBuf);
+      handleRequest(config, recorder, breakers, clientReq, clientRes, reqBodyBuf);
     });
     clientReq.on('error', () => clientRes.destroy());
   });
+  server.breakers = breakers; // exposed for tests / introspection
 
   server.listen(config.proxyPort, '127.0.0.1', () => {
     console.log(`[proxy] listening on http://127.0.0.1:${server.address().port}`);
@@ -106,7 +113,19 @@ export function startProxy(config, recorder) {
   return server;
 }
 
-function handleRequest(config, recorder, clientReq, clientRes, reqBodyBuf) {
+// Is any resilience feature (provider pool / breaker / rectifier) active for
+// this request? When false we take the original, untouched transparent path so
+// default behavior is byte-for-byte identical to before these features existed.
+function isResilient(config, wire) {
+  const group = wireToGroup(wire);
+  const pool = config.providers?.pools?.[group];
+  if (Array.isArray(pool) && pool.length > 0) return true;
+  if (config.breaker?.enabled) return true;
+  if (config.rectifier?.enabled && wire === 'anthropic') return true;
+  return false;
+}
+
+function handleRequest(config, recorder, breakers, clientReq, clientRes, reqBodyBuf) {
   const started = Date.now();
 
   // Step 2: pick the real upstream + wire format. The path alone tells us who
@@ -121,9 +140,17 @@ function handleRequest(config, recorder, clientReq, clientRes, reqBodyBuf) {
   // request and the response rather than forwarding bytes verbatim.
   if (config.compat?.anthropicTo === 'chat' && wire === 'anthropic'
       && (clientReq.url || '').split('?')[0].startsWith('/v1/messages')) {
-    handleAnthropicToChat(config, recorder, clientReq, clientRes, reqBodyBuf, started);
+    handleAnthropicToChat(config, recorder, breakers, clientReq, clientRes, reqBodyBuf, started);
     return;
   }
+
+  // Resilient transparent path: multi-provider failover + circuit breaker +
+  // (Anthropic) thinking rectification. Only taken when opted in.
+  if (isResilient(config, wire)) {
+    handleTransparentResilient(config, recorder, breakers, clientReq, clientRes, reqBodyBuf, started, wire);
+    return;
+  }
+
   const parser = PARSERS[wire];
   const upstreamUrl = new URL(clientReq.url, baseUrl);
   const isHttps = upstreamUrl.protocol === 'https:';
@@ -267,7 +294,7 @@ function handleRequest(config, recorder, clientReq, clientRes, reqBodyBuf) {
 //   response : OpenAI Chat (SSE or JSON) -> Anthropic events sent to the client
 // The client (Claude Code) never knows the vendor speaks a different protocol.
 // =============================================================================
-function handleAnthropicToChat(config, recorder, clientReq, clientRes, reqBodyBuf, started) {
+function handleAnthropicToChat(config, recorder, breakers, clientReq, clientRes, reqBodyBuf, started) {
   const anthBody = safeJsonParse(reqBodyBuf.toString('utf8')) || {};
   const wantStream = !!anthBody.stream;
   const originalModel = anthBody.model ?? null;
@@ -467,4 +494,319 @@ function handleAnthropicToChat(config, recorder, clientReq, clientRes, reqBodyBu
 
   upstreamReq.write(chatBodyBuf);
   upstreamReq.end();
+}
+
+// =============================================================================
+// Resilient transparent path: provider failover + circuit breaker + (Anthropic)
+// thinking rectification. Reached only when isResilient() is true. The default
+// transparent path above is left untouched so non-resilient traffic is
+// byte-for-byte identical to before.
+//
+// Per client request we walk the ordered provider candidates. For each:
+//   - skip it if its breaker is OPEN (and cooldown not elapsed);
+//   - send the request; on a 2xx we COMMIT (stream the bytes to the client,
+//     exactly like the transparent tee) and stop;
+//   - on a connection error or a "failover status" (default 429/5xx) we record
+//     the failure against the breaker and try the NEXT provider;
+//   - on a rectifiable Anthropic error we rewrite the body and retry the SAME
+//     provider ONCE (this is a client-compat fix, NOT counted as a breaker
+//     failure);
+//   - any other error (e.g. 401/403/400) is committed to the client as-is.
+// Failover is only possible BEFORE we start streaming a 2xx to the client — once
+// bytes are flowing we cannot cleanly switch providers, so we never do.
+// =============================================================================
+
+// One single HTTP attempt. Resolves with the upstream response object (caller
+// inspects the status) or a connection error — it never writes to the client.
+function transparentAttempt({ mod, upstreamUrl, method, outHeaders, bodyBuf }) {
+  return new Promise((resolve) => {
+    const req = mod.request(upstreamUrl, { method, headers: outHeaders }, (res) => resolve({ kind: 'response', res }));
+    req.on('error', (error) => resolve({ kind: 'connError', error }));
+    if (bodyBuf.length > 0) req.write(bodyBuf);
+    req.end();
+  });
+}
+
+// Buffer a (typically error) response fully, returning the raw bytes plus a
+// decoded text/JSON view so we can both inspect it (rectifier) and replay it
+// verbatim to the client if it turns out to be terminal.
+function drainResponse(upstreamRes, config) {
+  return new Promise((resolve) => {
+    const decoder = makeDecoder(upstreamRes.headers['content-encoding']);
+    const raw = [];
+    const dec = [];
+    const onDecoded = (buf) => dec.push(buf);
+    if (decoder) {
+      decoder.on('data', onDecoded);
+      decoder.on('error', () => {});
+    }
+    upstreamRes.on('data', (chunk) => {
+      if (raw.reduce((n, b) => n + b.length, 0) < config.maxBodyBytes) raw.push(chunk);
+      if (decoder) decoder.write(chunk);
+      else onDecoded(chunk);
+    });
+    upstreamRes.on('end', () => {
+      const finish = () => {
+        const rawBuf = Buffer.concat(raw);
+        const text = Buffer.concat(dec).toString('utf8');
+        resolve({ rawBuf, text, obj: safeJsonParse(text) });
+      };
+      if (decoder) decoder.end(() => finish());
+      else finish();
+    });
+    upstreamRes.on('error', () => resolve({ rawBuf: Buffer.concat(raw), text: Buffer.concat(dec).toString('utf8'), obj: null }));
+  });
+}
+
+// Commit a successful 2xx response: stream the bytes to the client (fidelity
+// first) while teeing a decoded copy into the parser. Mirrors the original
+// transparent tee. Resolves after the exchange is recorded.
+function streamUpstreamToClient(upstreamRes, clientRes, exchange, parser, config, recorder, started) {
+  return new Promise((resolve) => {
+    clientRes.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+    exchange.resStatus = upstreamRes.statusCode || 0;
+    exchange.resHeaders = upstreamRes.headers;
+    const contentType = String(upstreamRes.headers['content-type'] || '');
+    const isSSE = contentType.includes('text/event-stream');
+    const decoder = makeDecoder(upstreamRes.headers['content-encoding']);
+    const sse = isSSE ? new SSEParser() : null;
+    const agg = isSSE ? parser.createStreamAggregator() : null;
+    if (sse) sse.on('event', (e) => agg.feed(e));
+    const rawCopy = [];
+    let rawCopyLen = 0;
+    const onDecoded = (buf) => {
+      if (sse) sse.push(buf.toString('utf8'));
+      else if (rawCopyLen < config.maxBodyBytes) {
+        rawCopy.push(buf);
+        rawCopyLen += buf.length;
+      }
+    };
+    if (decoder) {
+      decoder.on('data', onDecoded);
+      decoder.on('error', () => {});
+    }
+    upstreamRes.on('data', (chunk) => {
+      clientRes.write(chunk);
+      if (decoder) decoder.write(chunk);
+      else onDecoded(chunk);
+    });
+    upstreamRes.on('end', () => {
+      clientRes.end();
+      const finalize = () => {
+        try {
+          if (sse) {
+            sse.flush();
+            exchange.response = agg.result();
+          } else {
+            exchange.response = parser.parseResponse(Buffer.concat(rawCopy).toString('utf8'));
+          }
+        } catch (err) {
+          exchange.response = { text: '', toolCalls: [], stopReason: null, usage: null, raw: null, parseError: err.message };
+        }
+        exchange.durationMs = Date.now() - started;
+        recorder.record(exchange);
+        resolve();
+      };
+      if (decoder) decoder.end(() => finalize());
+      else finalize();
+    });
+    upstreamRes.on('error', (err) => {
+      exchange.error = `upstream stream error: ${err.message}`;
+      exchange.durationMs = Date.now() - started;
+      recorder.record(exchange);
+      clientRes.destroy();
+      resolve();
+    });
+  });
+}
+
+function errMessage(obj) {
+  if (obj && typeof obj === 'object') return obj.error?.message ?? obj.message ?? null;
+  return null;
+}
+
+function makeExchange({ started, wire, method, url, clientReq, bodyBuf, parser, config }) {
+  let parsedRequest;
+  try {
+    parsedRequest = parser.parseRequest(bodyBuf.toString('utf8'));
+  } catch {
+    parsedRequest = { wire, model: null, messages: [], tools: [], stream: false, raw: null };
+  }
+  return {
+    id: randomUUID(),
+    ts: new Date(started).toISOString(),
+    durationMs: 0,
+    wire,
+    method,
+    url,
+    reqHeaders: redactHeaders(clientReq.headers, config.redactAuth),
+    requestBodyRaw: truncate(bodyBuf, config.maxBodyBytes).text,
+    request: parsedRequest,
+    resStatus: 0,
+    resHeaders: {},
+    response: null,
+    error: null,
+  };
+}
+
+async function handleTransparentResilient(config, recorder, breakers, clientReq, clientRes, reqBodyBuf, started, wire) {
+  const parser = PARSERS[wire];
+  const candidates = resolveCandidates(config, wire);
+  const group = wireToGroup(wire);
+  const poolConfigured = (config.providers?.pools?.[group]?.length || 0) > 0;
+  const useBreaker = !!(config.breaker?.enabled || poolConfigured);
+  const failoverStatuses = config.breaker?.failoverStatuses || new Set([429, 500, 502, 503, 504]);
+  const rectifyOn = !!(config.rectifier?.enabled && wire === 'anthropic');
+
+  // Verbatim client headers minus hop-by-hop (host/content-length recomputed).
+  const baseHeaders = {};
+  for (const [k, v] of Object.entries(clientReq.headers)) {
+    if (!HOP_BY_HOP.has(k.toLowerCase())) baseHeaders[k] = v;
+  }
+
+  const anthObj = wire === 'anthropic' ? (safeJsonParse(reqBodyBuf.toString('utf8')) || {}) : null;
+
+  let lastError = null; // {statusCode, headers, rawBuf} of the most recent failover
+  let attemptNo = 0;
+  let attemptedAny = false;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const cand = candidates[i];
+    const isLast = i === candidates.length - 1;
+
+    let permit = { allowed: true, halfOpen: false };
+    if (useBreaker) {
+      permit = breakers.canRequest(cand.id);
+      if (!permit.allowed) continue; // breaker OPEN: skip this provider
+    }
+    attemptedAny = true;
+
+    let bodyBuf = reqBodyBuf;
+    let rectifiedKind = null;
+    let rectifyTried = false;
+
+    // Inner loop runs the candidate at most twice: once normally, once more
+    // after a rectification rewrite. The breaker permit is held across BOTH
+    // sub-attempts and released exactly once at the candidate's terminal outcome.
+    for (;;) {
+      attemptNo += 1;
+      const upstreamUrl = new URL(clientReq.url, cand.baseUrl);
+      const mod = upstreamUrl.protocol === 'https:' ? https : http;
+      const outHeaders = { ...baseHeaders, host: upstreamUrl.host };
+      if (bodyBuf.length > 0) outHeaders['content-length'] = String(bodyBuf.length);
+      // Provider-specific key override: swap in this provider's credential in
+      // the auth style its wire expects. Without an override we forward the
+      // client's own header unchanged (transparent default).
+      if (cand.apiKey) {
+        if (wire === 'anthropic') {
+          outHeaders['x-api-key'] = cand.apiKey;
+          delete outHeaders['authorization'];
+        } else {
+          outHeaders['authorization'] = `Bearer ${cand.apiKey}`;
+          delete outHeaders['x-api-key'];
+        }
+      }
+
+      const exchange = makeExchange({ started, wire, method: clientReq.method, url: upstreamUrl.toString(), clientReq, bodyBuf, parser, config });
+      exchange.resilience = { providerId: cand.id, attempt: attemptNo };
+      if (rectifiedKind) exchange.resilience.rectified = rectifiedKind;
+
+      const attempt = await transparentAttempt({ mod, upstreamUrl, method: clientReq.method, outHeaders, bodyBuf });
+
+      if (attempt.kind === 'connError') {
+        exchange.error = `upstream request error: ${attempt.error.message}`;
+        exchange.durationMs = Date.now() - started;
+        exchange.resilience.failedOver = !isLast;
+        recorder.record(exchange);
+        if (useBreaker) breakers.recordFailure(cand.id, permit.halfOpen);
+        break; // try next candidate
+      }
+
+      const upstreamRes = attempt.res;
+      const status = upstreamRes.statusCode || 0;
+
+      if (status >= 200 && status < 300) {
+        await streamUpstreamToClient(upstreamRes, clientRes, exchange, parser, config, recorder, started);
+        if (useBreaker) breakers.recordSuccess(cand.id, permit.halfOpen);
+        return;
+      }
+
+      const drained = await drainResponse(upstreamRes, config);
+      exchange.resStatus = status;
+      exchange.resHeaders = upstreamRes.headers;
+      exchange.error = errMessage(drained.obj) || `upstream ${status}`;
+      try {
+        exchange.response = parser.parseResponse(drained.text);
+      } catch (err) {
+        exchange.response = { text: '', toolCalls: [], stopReason: null, usage: null, raw: null, parseError: err.message };
+      }
+
+      // (a) rectifiable Anthropic error -> rewrite + retry SAME provider once.
+      if (rectifyOn && !rectifyTried) {
+        const kind = detectRectification(status, drained.obj, config.rectifier);
+        if (kind) {
+          rectifyTried = true;
+          rectifiedKind = kind;
+          exchange.resilience.rectifyTriggered = kind;
+          exchange.durationMs = Date.now() - started;
+          recorder.record(exchange); // log the pre-rectify failure (no breaker change)
+          bodyBuf = Buffer.from(JSON.stringify(applyRectification(kind, anthObj)));
+          continue; // retry same candidate with rectified body (permit still held)
+        }
+      }
+
+      // (b) failover-eligible and another provider remains -> try next.
+      if (failoverStatuses.has(status) && !isLast) {
+        exchange.resilience.failedOver = true;
+        exchange.durationMs = Date.now() - started;
+        recorder.record(exchange);
+        if (useBreaker) breakers.recordFailure(cand.id, permit.halfOpen);
+        lastError = { statusCode: status, headers: upstreamRes.headers, rawBuf: drained.rawBuf };
+        break;
+      }
+
+      // (c) terminal error -> commit to client as-is.
+      {
+        const headers = {};
+        for (const [k, v] of Object.entries(upstreamRes.headers)) {
+          if (!HOP_BY_HOP.has(k.toLowerCase())) headers[k] = v;
+        }
+        headers['content-length'] = String(drained.rawBuf.length);
+        clientRes.writeHead(status, headers);
+        clientRes.end(drained.rawBuf);
+        exchange.durationMs = Date.now() - started;
+        recorder.record(exchange);
+        if (useBreaker) {
+          // 5xx/429 reflect provider health; other 4xx are client/usage errors.
+          if (failoverStatuses.has(status)) breakers.recordFailure(cand.id, permit.halfOpen);
+          else breakers.recordNeutral(cand.id, permit.halfOpen);
+        }
+        return;
+      }
+    }
+  }
+
+  // All candidates exhausted (failed over or all breakers open). Replay the last
+  // buffered error if we have one, else synthesize a 502.
+  if (!clientRes.headersSent) {
+    if (lastError) {
+      const headers = {};
+      for (const [k, v] of Object.entries(lastError.headers)) {
+        if (!HOP_BY_HOP.has(k.toLowerCase())) headers[k] = v;
+      }
+      headers['content-length'] = String(lastError.rawBuf.length);
+      clientRes.writeHead(lastError.statusCode, headers);
+      clientRes.end(lastError.rawBuf);
+    } else {
+      const msg = attemptedAny ? 'all upstream providers failed' : 'all providers unavailable (circuit open)';
+      const payload = wire === 'anthropic'
+        ? { type: 'error', error: { type: 'proxy_error', message: msg } }
+        : { error: { type: 'proxy_error', message: msg } };
+      const buf = Buffer.from(JSON.stringify(payload));
+      clientRes.writeHead(502, { 'content-type': 'application/json; charset=utf-8', 'content-length': String(buf.length) });
+      clientRes.end(buf);
+    }
+  } else {
+    clientRes.end();
+  }
 }
