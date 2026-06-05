@@ -165,6 +165,20 @@ java -jar target/cli-proxy-logger-1.0.0.jar
 ```
 然后 Claude Code 照常配置（base URL 指向代理、`x-api-key` 带 key）即可，代理会自动把它翻译成 chat 请求发往上游。
 
+**客户端 Claude Code 配置（已用真实「只支持 chat 的厂商」实测）**
+
+客户端全用环境变量配置（代理这侧按上面「开启方式」把 `proxy.openai-upstream` / `PROXY_OPENAI_UPSTREAM` 指向只认 `/v1/chat/completions` 的厂商）：
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8788              # 不带 /v1，Claude Code 自己拼 /v1/messages
+export ANTHROPIC_API_KEY=<上游厂商的 key>                     # 以 x-api-key 发出，代理原样转发给上游
+export ANTHROPIC_MODEL=claude-sonnet-4-6                     # 主模型；按 model-map → 上游 gpt-4o
+export ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4-5-20251001  # 后台小/快模型；按 model-map → gpt-4o-mini
+claude
+```
+> **两个坑**：① 模型映射必须把 Claude Code 用到的**每个**模型名都映射到上游真实模型——尤其后台任务用的 **haiku 档**，漏了它那条后台请求会以原模型名透传、上游可能不认而报错；② `ANTHROPIC_BASE_URL` **不带 `/v1`**（与 Codex/opencode 相反），带了会变成 `/v1/v1/messages` 而 404。
+>
+> 实测（在 Node 版上端到端验证，三套翻译逻辑一致）：上游用 `https://api.freemodel.dev`（只支持 chat），映射 `claude-sonnet-4-6→gpt-4o`、`claude-haiku-4-5-20251001→gpt-4o-mini`，跑真实 Claude Code，`Read` 等工具调用全程正常；UI 里每条记录标 `anthropic` 但上游 URL 是 `…/v1/chat/completions`，即翻译生效。
+
 **翻译都做了什么**
 1. **请求**：Anthropic `/v1/messages` → OpenAI `/v1/chat/completions`：`system` → system 消息；content blocks（文本/图片）展开；`tool_use` → `tool_calls`、`tool_result` → `tool` 角色消息；`tools[].input_schema` → `function.parameters`；鉴权 `x-api-key: K` → `Authorization: Bearer K`。
 2. **模型映射**：按 `proxy.model-map`/`proxy.model-map-file` 把进来的模型名换成上游模型名（正好覆盖 Claude Code 的 opus/sonnet/haiku 三档）；没命中就原样透传。
