@@ -19,4 +19,10 @@ public class Exchange {
     public Map<String, String> resHeaders;
     public NormalizedResponse response;
     public String error;
+    /**
+     * 协议翻译元数据（仅当 ANTHROPIC_COMPAT=chat 把 /v1/messages 转成
+     * /v1/chat/completions 时存在）：记录 {from,to,model,upstreamModel}。
+     * 透明转发时为 null。
+     */
+    public Map<String, Object> translation;
 }

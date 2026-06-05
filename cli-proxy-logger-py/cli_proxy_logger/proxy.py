@@ -11,6 +11,7 @@ Flow:
 """
 
 import http.client
+import json
 import threading
 import uuid
 import zlib
@@ -18,8 +19,17 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from .parsers import PARSERS
+from .model import safe_json_parse
+from .parsers import PARSERS, openai_chat
 from .sse import SSEParser
+from .translate import (
+    anthropic_request_to_chat,
+    chat_response_to_anthropic,
+    chat_error_to_anthropic,
+    anthropic_message_to_sse,
+    anthropic_error_sse,
+    ChatToAnthropicStream,
+)
 from .upstream import resolve_upstream
 
 # "Hop-by-hop" headers are meaningful only for a single transport connection
@@ -113,6 +123,17 @@ def _make_handler(config, recorder):
             lower_headers = {k.lower(): v for k, v in self.headers.items()}
             info = resolve_upstream(config, self.path, lower_headers)
             wire = info["wire"]
+
+            # Compat mode: when ANTHROPIC_COMPAT=chat and the client speaks
+            # Anthropic Messages, hand off to the TRANSLATING path (Anthropic ->
+            # OpenAI Chat) instead of the transparent tee. This is the only case
+            # where we rewrite both the request and the response.
+            compat = config.get("compat") or {}
+            if (compat.get("anthropicTo") == "chat" and wire == "anthropic"
+                    and self.path.split("?")[0].startswith("/v1/messages")):
+                self._handle_anthropic_to_chat(config, recorder, req_body, started)
+                return
+
             parser = PARSERS[wire]
 
             split = urlsplit(info["baseUrl"])
@@ -270,6 +291,225 @@ def _make_handler(config, recorder):
             except Exception as err:
                 exchange["response"] = {"text": "", "toolCalls": [], "stopReason": None,
                                         "usage": None, "raw": None, "parseError": str(err)}
+
+            exchange["durationMs"] = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            recorder.record(exchange)
+            conn.close()
+
+        # =================================================================
+        # Compat path: Anthropic /v1/messages -> OpenAI /v1/chat/completions
+        #
+        # Unlike _handle (transparent tee), this REWRITES both directions:
+        #   request  : translate.anthropic_request_to_chat() -> POST /v1/chat/completions
+        #   response : OpenAI Chat (SSE or JSON) -> Anthropic events to the client
+        # The client (Claude Code) never knows the vendor speaks a different
+        # protocol.
+        # =================================================================
+        def _handle_anthropic_to_chat(self, config, recorder, req_body, started):
+            anth_body = safe_json_parse(req_body.decode("utf-8", "replace")) or {}
+            want_stream = bool(anth_body.get("stream"))
+            original_model = anth_body.get("model")
+            model_map = (config.get("compat") or {}).get("modelMap") or {}
+
+            # 1) Translate the request body and pick the mapped model.
+            chat_body = anthropic_request_to_chat(anth_body, model_map)
+            mapped_model = chat_body.get("model")
+            chat_body_bytes = json.dumps(chat_body).encode("utf-8")
+
+            # 2) Build the upstream request to the OpenAI-style vendor.
+            split = urlsplit(config["upstream"]["openai"])
+            scheme = split.scheme or "https"
+            host = split.hostname
+            port = split.port or (443 if scheme == "https" else 80)
+            netloc = split.netloc
+            path = "/v1/chat/completions"
+            upstream_url = f"{scheme}://{netloc}{path}"
+
+            # Copy client headers minus hop-by-hop, then fix up auth + content for
+            # an OpenAI vendor: Claude Code authenticates with `x-api-key`, but
+            # OpenAI-style vendors expect `Authorization: Bearer`. Translate that,
+            # and drop Anthropic-only headers the vendor would not understand.
+            drop = {"x-api-key", "anthropic-version", "anthropic-beta",
+                    "anthropic-dangerous-direct-browser-access", "content-type"}
+            out_headers = {}
+            for k, v in self.headers.items():
+                lk = k.lower()
+                if lk in HOP_BY_HOP or lk in drop:
+                    continue
+                out_headers[k] = v
+            auth = self.headers.get("authorization")
+            api_key = self.headers.get("x-api-key")
+            if auth:
+                out_headers["Authorization"] = auth
+            elif api_key:
+                out_headers["Authorization"] = f"Bearer {api_key}"
+            out_headers["Host"] = netloc
+            out_headers["Content-Type"] = "application/json"
+            out_headers["Content-Length"] = str(len(chat_body_bytes))
+
+            # 3) Record the exchange as an Anthropic request (what the client
+            # sent) with a translation marker; response is normalized from chat.
+            try:
+                parsed_request = PARSERS["anthropic"].parse_request(req_body.decode("utf-8", "replace"))
+            except Exception:
+                parsed_request = {"wire": "anthropic", "model": original_model, "messages": [],
+                                  "tools": [], "stream": want_stream, "raw": None}
+            exchange = {
+                "id": str(uuid.uuid4()),
+                "ts": started.isoformat().replace("+00:00", "Z"),
+                "durationMs": 0,
+                "wire": "anthropic",
+                "method": self.command,
+                "url": upstream_url,
+                "reqHeaders": _redact_headers(self.headers.items(), config["redactAuth"]),
+                "requestBodyRaw": _truncate(req_body, config["maxBodyBytes"]),
+                "request": parsed_request,
+                "translation": {"from": "anthropic", "to": "chat",
+                                "model": original_model, "upstreamModel": mapped_model},
+                "resStatus": 0,
+                "resHeaders": {},
+                "response": None,
+                "error": None,
+            }
+
+            # 4) Open the upstream connection and send the translated request.
+            if scheme == "https":
+                conn = http.client.HTTPSConnection(host, port, timeout=600)
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=600)
+            try:
+                conn.request("POST", path, body=chat_body_bytes, headers=out_headers)
+                upstream_res = conn.getresponse()
+            except Exception as err:
+                exchange["error"] = f"upstream request error: {err}"
+                exchange["durationMs"] = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                recorder.record(exchange)
+                body = json.dumps(chat_error_to_anthropic(
+                    {"error": {"type": "proxy_error", "message": "upstream request failed"}})).encode("utf-8")
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = True
+                conn.close()
+                return
+
+            status = upstream_res.status
+            exchange["resStatus"] = status
+            exchange["resHeaders"] = {k: v for k, v in upstream_res.getheaders()}
+            content_type = upstream_res.getheader("content-type") or ""
+            is_sse = "text/event-stream" in content_type
+            decode = _make_stream_decoder(upstream_res.getheader("content-encoding"))
+
+            if is_sse:
+                # ---- streaming translation ----
+                self.send_response_only(status, upstream_res.reason)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+
+                translator = ChatToAnthropicStream(original_model or mapped_model)
+                chat_agg = openai_chat.create_stream_aggregator()  # for logging
+                sse = SSEParser()
+
+                def on_event(evt):
+                    raw = (evt.get("data") or "").strip()
+                    if raw == "" or raw == "[DONE]":
+                        return
+                    data = safe_json_parse(raw)
+                    if not data:
+                        return
+                    chat_agg["feed"](evt)  # normalized response for the log
+                    for frame in translator.feed(data):
+                        try:
+                            self.wfile.write(frame.encode("utf-8"))
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionError, OSError):
+                            pass
+
+                sse.on("event", on_event)
+                while True:
+                    chunk = upstream_res.read(65536)
+                    if not chunk:
+                        break
+                    decoded = decode(chunk)
+                    if decoded:
+                        sse.push(decoded.decode("utf-8", "replace"))
+                sse.flush()
+                for frame in translator.end():
+                    try:
+                        self.wfile.write(frame.encode("utf-8"))
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionError, OSError):
+                        pass
+                try:
+                    exchange["response"] = chat_agg["result"]()
+                except Exception as err:
+                    exchange["response"] = {"text": "", "toolCalls": [], "stopReason": None,
+                                            "usage": None, "raw": None, "parseError": str(err)}
+            else:
+                # ---- buffered (non-SSE) translation ----
+                # Covers a plain JSON chat completion and error bodies. We may
+                # still owe the client an SSE stream (if it asked for one), in
+                # which case we synthesize the Anthropic event sequence.
+                raw_copy = bytearray()
+                while True:
+                    chunk = upstream_res.read(65536)
+                    if not chunk:
+                        break
+                    decoded = decode(chunk)
+                    if decoded:
+                        raw_copy.extend(decoded)
+                body_text = bytes(raw_copy).decode("utf-8", "replace")
+                obj = safe_json_parse(body_text)
+                is_error = status >= 400 or (isinstance(obj, dict) and obj.get("error"))
+
+                if is_error:
+                    anth_err = chat_error_to_anthropic(obj if obj is not None else body_text)
+                    if want_stream:
+                        frame = anthropic_error_sse(obj if obj is not None else body_text).encode("utf-8")
+                        self.send_response_only(status)
+                        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.wfile.write(frame)
+                    else:
+                        out = json.dumps(anth_err).encode("utf-8")
+                        self.send_response_only(status)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(out)))
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.wfile.write(out)
+                    exchange["error"] = anth_err["error"]["message"]
+                else:
+                    anth_obj = chat_response_to_anthropic(obj or {}, original_model or mapped_model)
+                    if want_stream:
+                        self.send_response_only(status)
+                        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        for frame in anthropic_message_to_sse(anth_obj):
+                            self.wfile.write(frame.encode("utf-8"))
+                    else:
+                        out = json.dumps(anth_obj).encode("utf-8")
+                        self.send_response_only(status)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(out)))
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.wfile.write(out)
+                self.close_connection = True
+                try:
+                    exchange["response"] = openai_chat.parse_response(body_text)
+                except Exception as err:
+                    exchange["response"] = {"text": "", "toolCalls": [], "stopReason": None,
+                                            "usage": None, "raw": None, "parseError": str(err)}
 
             exchange["durationMs"] = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
             recorder.record(exchange)

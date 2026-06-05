@@ -141,6 +141,35 @@ OPENAI_UPSTREAM=https://api.freemodel.dev ANTHROPIC_UPSTREAM=https://cc.freemode
 | `ANTHROPIC_UPSTREAM` | `https://api.anthropic.com` | Anthropic 上游 |
 | `OPENAI_UPSTREAM` | `https://api.openai.com` | OpenAI 上游 |
 | `MAX_BODY_BYTES` | `2000000` | 单条 body 落盘上限，超出截断 |
+| `ANTHROPIC_COMPAT` | 关闭（透明直通） | 设为 `chat` 时开启「协议翻译」：把进来的 Anthropic `/v1/messages` 翻译成 OpenAI `/v1/chat/completions` 发往 `OPENAI_UPSTREAM`（见下一节） |
+| `MODEL_MAP` | 空 | 模型映射表，JSON（`{"claude-sonnet-4-6":"gpt-4o"}`）或逗号分隔（`claude-sonnet-4-6=gpt-4o,claude-haiku-4-5=gpt-4o-mini`）；没命中就原样透传模型名 |
+| `MODEL_MAP_FILE` | 空 | 模型映射 JSON 文件路径（优先于 `MODEL_MAP`） |
+
+## 协议翻译：让只支持 `/v1/chat/completions` 的厂商也能跑 Claude Code
+
+**场景**：有的第三方厂商/路由**只认 OpenAI `/v1/chat/completions`**，不支持 Anthropic `/v1/messages`。而 Claude Code（以及 opencode 的 anthropic provider）只会说 Anthropic 协议。开启**协议翻译**后，代理在中间做格式转换，Claude Code 端**完全无感**。
+
+> 默认是**透明直通**（不翻译，原样转发）。翻译是 **opt-in**，只有设了 `ANTHROPIC_COMPAT=chat` 才开启，且只作用于 `/v1/messages`；其它路径（`/v1/responses`、`/v1/chat/completions`）仍透明转发。
+
+**开启方式**
+```bash
+ANTHROPIC_COMPAT=chat \
+OPENAI_UPSTREAM=https://only-chat-vendor.example.com \
+MODEL_MAP='{"claude-sonnet-4-6":"gpt-4o","claude-haiku-4-5":"gpt-4o-mini"}' \
+npm start
+```
+然后 Claude Code 照常配置（base URL 指向代理、`x-api-key` 带 key）即可，代理会自动把它翻译成 chat 请求发往上游。
+
+**翻译都做了什么**
+1. **请求**：Anthropic `/v1/messages` → OpenAI `/v1/chat/completions`：`system` → system 消息；content blocks（文本/图片）展开；`tool_use` → `tool_calls`、`tool_result` → `tool` 角色消息；`tools[].input_schema` → `function.parameters`；鉴权 `x-api-key: K` → `Authorization: Bearer K`。
+2. **模型映射**：按 `MODEL_MAP`/`MODEL_MAP_FILE` 把进来的模型名换成上游模型名（正好覆盖 Claude Code 的 opus/sonnet/haiku 三档）；没命中就原样透传。
+3. **响应（最难）**：把上游回来的 OpenAI chat **SSE 流**（`choices[].delta`、`delta.tool_calls[]` 按 index 聚合）**实时**翻译回 Anthropic 事件流（`message_start` / `content_block_start` / `content_block_delta`(`text_delta`、`input_json_delta`) / `content_block_stop` / `message_delta` / `message_stop`）；非流式则整包转一次，若客户端要的是流式还会把整包合成成 SSE 回放。`finish_reason` → `stop_reason`、`usage` 字段也做映射。
+4. **落盘**：翻译类请求在 JSONL 里带一个 `translation` 字段（`{from, to, model, upstreamModel}`），方便排查。
+
+> **模型映射文件示例**（`MODEL_MAP_FILE=./model-map.json`）：
+> ```json
+> { "claude-opus-4": "gpt-4o", "claude-sonnet-4-6": "gpt-4o", "claude-haiku-4-5": "gpt-4o-mini" }
+> ```
 
 ## 内网打包与部署（离线）
 

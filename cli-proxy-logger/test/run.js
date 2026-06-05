@@ -93,7 +93,26 @@ const ANTHROPIC_JSON = JSON.stringify({
   usage: { input_tokens: 3, output_tokens: 4 },
 });
 
-function mockUpstream() {
+// Non-streaming OpenAI Chat completion, used by the compat (Anthropic->Chat) tests.
+const CHAT_JSON = JSON.stringify({
+  id: 'chatcmpl_1',
+  object: 'chat.completion',
+  model: 'gpt-4o-mini',
+  choices: [
+    {
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: 'Here you go.',
+        tool_calls: [{ id: 'call_7', type: 'function', function: { name: 'search', arguments: '{"q":"dogs"}' } }],
+      },
+      finish_reason: 'tool_calls',
+    },
+  ],
+  usage: { prompt_tokens: 5, completion_tokens: 9, total_tokens: 14 },
+});
+
+function mockUpstream(state = {}) {
   return http.createServer((req, res) => {
     let body = '';
     req.on('data', (c) => (body += c));
@@ -112,8 +131,16 @@ function mockUpstream() {
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         res.end(RESPONSES_STREAM);
       } else if (req.url.startsWith('/v1/chat/completions')) {
-        res.writeHead(200, { 'content-type': 'text/event-stream' });
-        res.end(CHAT_STREAM);
+        // Record the translated request so compat tests can assert on it.
+        state.lastChat = reqObj;
+        state.lastChatHeaders = req.headers;
+        if (stream) {
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          res.end(CHAT_STREAM);
+        } else {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(CHAT_JSON);
+        }
       } else {
         res.writeHead(404);
         res.end('no');
@@ -142,7 +169,8 @@ function post(port, path, bodyObj, headers = {}) {
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
-  const mock = mockUpstream();
+  const state = {};
+  const mock = mockUpstream(state);
   await new Promise((r) => mock.listen(0, '127.0.0.1', r));
   const mockPort = mock.address().port;
   const mockUrl = `http://127.0.0.1:${mockPort}`;
@@ -208,8 +236,74 @@ async function main() {
   check('chat stream: tool args parsed', e4.response.toolCalls[0].args.q === 'cats');
   check('chat stream: finish_reason', e4.response.stopReason === 'tool_calls');
 
+  // 5. COMPAT MODE: Anthropic /v1/messages -> OpenAI /v1/chat/completions.
+  // Start a second proxy with ANTHROPIC_COMPAT=chat and a model map, pointing the
+  // OpenAI upstream at the same mock. The client speaks Anthropic; the upstream
+  // is hit on /v1/chat/completions; the client gets Anthropic format back.
+  const compatConfig = loadConfig({
+    proxyPort: 0,
+    uiPort: 0,
+    logDir: fileURLToPath(new URL('./.tmp-logs', import.meta.url)),
+    upstream: { anthropic: mockUrl, openai: mockUrl },
+    compat: { anthropicTo: 'chat', modelMap: { 'claude-sonnet-4-6': 'gpt-4o', 'claude-haiku-4-5': 'gpt-4o-mini' } },
+  });
+  const compatRecorder = new Recorder(compatConfig);
+  const compatProxy = startProxy(compatConfig, compatRecorder);
+  await new Promise((r) => compatProxy.on('listening', r));
+  const compatPort = compatProxy.address().port;
+
+  // 5a. compat streaming: client sends Anthropic, gets Anthropic SSE back.
+  const c1 = await post(
+    compatPort,
+    '/v1/messages',
+    {
+      model: 'claude-sonnet-4-6',
+      stream: true,
+      system: 'be brief',
+      tools: [{ name: 'search', description: 'web', input_schema: { type: 'object', properties: { q: { type: 'string' } } } }],
+      messages: [{ role: 'user', content: 'find cats' }],
+    },
+    { 'x-api-key': 'sk-anthropic-secret-123', 'anthropic-version': '2023-06-01' },
+  );
+  await wait(60);
+  check('compat stream: upstream hit on chat with mapped model', state.lastChat && state.lastChat.model === 'gpt-4o');
+  check('compat stream: upstream got system as system message', state.lastChat.messages[0].role === 'system' && state.lastChat.messages[0].content === 'be brief');
+  check('compat stream: upstream got tools as function schema', state.lastChat.tools[0].type === 'function' && state.lastChat.tools[0].function.name === 'search');
+  check('compat stream: upstream auth translated x-api-key -> Bearer', state.lastChatHeaders.authorization === 'Bearer sk-anthropic-secret-123');
+  check('compat stream: client got Anthropic message_start', c1.body.includes('event: message_start'));
+  check('compat stream: client got tool_use block', c1.body.includes('"type":"tool_use"') && c1.body.includes('"name":"search"'));
+  check('compat stream: client got input_json_delta', c1.body.includes('input_json_delta'));
+  check('compat stream: client got message_stop', c1.body.includes('event: message_stop'));
+  check('compat stream: client got mapped-back tool args', c1.body.includes('cats'));
+  const ce1 = compatRecorder.recent[0];
+  check('compat stream: recorded as anthropic wire', ce1.wire === 'anthropic');
+  check('compat stream: translation marker present', ce1.translation && ce1.translation.upstreamModel === 'gpt-4o');
+  check('compat stream: normalized tool call recorded', ce1.response.toolCalls[0].name === 'search' && ce1.response.toolCalls[0].args.q === 'cats');
+
+  // 5b. compat non-streaming: client sends Anthropic, gets a single Anthropic JSON message.
+  const c2 = await post(
+    compatPort,
+    '/v1/messages',
+    { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    { 'x-api-key': 'sk-2', 'anthropic-version': '2023-06-01' },
+  );
+  await wait(60);
+  check('compat json: upstream hit with mapped model', state.lastChat.model === 'gpt-4o-mini');
+  const c2obj = JSON.parse(c2.body);
+  check('compat json: client got Anthropic message shape', c2obj.type === 'message' && c2obj.role === 'assistant');
+  check('compat json: text block translated', c2obj.content.some((b) => b.type === 'text' && b.text === 'Here you go.'));
+  check('compat json: tool_use block translated', c2obj.content.some((b) => b.type === 'tool_use' && b.name === 'search' && b.input.q === 'dogs'));
+  check('compat json: stop_reason mapped to tool_use', c2obj.stop_reason === 'tool_use');
+  check('compat json: usage mapped to input/output tokens', c2obj.usage.input_tokens === 5 && c2obj.usage.output_tokens === 9);
+
+  // 5c. unmapped model passes through unchanged.
+  await post(compatPort, '/v1/messages', { model: 'some-unmapped-model', messages: [{ role: 'user', content: 'hi' }] }, { 'x-api-key': 'sk-3' });
+  await wait(40);
+  check('compat: unmapped model passes through', state.lastChat.model === 'some-unmapped-model');
+
   console.log(`\nAll ${pass} checks passed.`);
   proxy.close();
+  compatProxy.close();
   mock.close();
 }
 

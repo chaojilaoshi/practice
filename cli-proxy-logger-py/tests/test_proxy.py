@@ -100,6 +100,18 @@ ANTHROPIC_JSON = (
     '"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":4}}'
 )
 
+# Non-streaming OpenAI Chat completion, used by the compat (Anthropic->Chat) tests.
+CHAT_JSON = (
+    '{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-4o-mini","choices":[{"index":0,'
+    '"message":{"role":"assistant","content":"Here you go.","tool_calls":[{"id":"call_7",'
+    '"type":"function","function":{"name":"search","arguments":"{\\"q\\":\\"dogs\\"}"}}]},'
+    '"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":9,"total_tokens":14}}'
+)
+
+# Captures the last translated /v1/chat/completions request so compat tests can
+# assert on it (model mapping, system message, translated auth header, ...).
+STATE = {}
+
 
 def _mock_handler():
     class MockUpstream(BaseHTTPRequestHandler):
@@ -133,7 +145,12 @@ def _mock_handler():
             elif self.path.startswith("/v1/responses"):
                 send(RESPONSES_STREAM, "text/event-stream")
             elif self.path.startswith("/v1/chat/completions"):
-                send(CHAT_STREAM, "text/event-stream")
+                STATE["lastChat"] = req
+                STATE["lastChatHeaders"] = {k.lower(): v for k, v in self.headers.items()}
+                if stream:
+                    send(CHAT_STREAM, "text/event-stream")
+                else:
+                    send(CHAT_JSON, "application/json")
             else:
                 self.send_response(404)
                 self.send_header("Content-Length", "2")
@@ -236,6 +253,73 @@ def main():
     check("chat stream: tool name", e4["response"]["toolCalls"][0]["name"] == "search")
     check("chat stream: tool args parsed", e4["response"]["toolCalls"][0]["args"]["q"] == "cats")
     check("chat stream: finish_reason", e4["response"]["stopReason"] == "tool_calls")
+
+    # 5. COMPAT MODE: Anthropic /v1/messages -> OpenAI /v1/chat/completions.
+    # Start a second proxy with ANTHROPIC_COMPAT=chat + a model map, pointing the
+    # OpenAI upstream at the same mock. Client speaks Anthropic; upstream is hit on
+    # /v1/chat/completions; client gets Anthropic format back.
+    import json as _json
+    compat_config = load_config(
+        proxyPort=0,
+        uiPort=0,
+        logDir=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tmp-logs"),
+        upstream={"anthropic": mock_url, "openai": mock_url},
+        compat={"anthropicTo": "chat",
+                "modelMap": {"claude-sonnet-4-6": "gpt-4o", "claude-haiku-4-5": "gpt-4o-mini"}},
+    )
+    compat_recorder = Recorder(compat_config)
+    start_proxy(compat_config, compat_recorder)
+    compat_port = compat_config["proxyPort"]
+    time.sleep(0.1)
+
+    # 5a. compat streaming: client sends Anthropic, gets Anthropic SSE back.
+    c1 = _post(compat_port, "/v1/messages",
+               {"model": "claude-sonnet-4-6", "stream": True, "system": "be brief",
+                "tools": [{"name": "search", "description": "web",
+                           "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}],
+                "messages": [{"role": "user", "content": "find cats"}]},
+               {"x-api-key": "sk-anthropic-secret-123", "anthropic-version": "2023-06-01"})
+    time.sleep(0.08)
+    check("compat stream: upstream hit on chat with mapped model", STATE["lastChat"]["model"] == "gpt-4o")
+    check("compat stream: upstream got system as system message",
+          STATE["lastChat"]["messages"][0]["role"] == "system" and STATE["lastChat"]["messages"][0]["content"] == "be brief")
+    check("compat stream: upstream got tools as function schema",
+          STATE["lastChat"]["tools"][0]["type"] == "function" and STATE["lastChat"]["tools"][0]["function"]["name"] == "search")
+    check("compat stream: upstream auth translated x-api-key -> Bearer",
+          STATE["lastChatHeaders"]["authorization"] == "Bearer sk-anthropic-secret-123")
+    check("compat stream: client got Anthropic message_start", "event: message_start" in c1["body"])
+    check("compat stream: client got tool_use block", "tool_use" in c1["body"] and "search" in c1["body"])
+    check("compat stream: client got input_json_delta", "input_json_delta" in c1["body"])
+    check("compat stream: client got message_stop", "event: message_stop" in c1["body"])
+    check("compat stream: client got mapped-back tool args", "cats" in c1["body"])
+    ce1 = compat_recorder.recent[0]
+    check("compat stream: recorded as anthropic wire", ce1["wire"] == "anthropic")
+    check("compat stream: translation marker present",
+          ce1.get("translation") and ce1["translation"]["upstreamModel"] == "gpt-4o")
+    check("compat stream: normalized tool call recorded",
+          ce1["response"]["toolCalls"][0]["name"] == "search" and ce1["response"]["toolCalls"][0]["args"]["q"] == "cats")
+
+    # 5b. compat non-streaming: client sends Anthropic, gets a single Anthropic JSON message.
+    c2 = _post(compat_port, "/v1/messages",
+               {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]},
+               {"x-api-key": "sk-2", "anthropic-version": "2023-06-01"})
+    time.sleep(0.08)
+    check("compat json: upstream hit with mapped model", STATE["lastChat"]["model"] == "gpt-4o-mini")
+    c2obj = _json.loads(c2["body"])
+    check("compat json: client got Anthropic message shape", c2obj["type"] == "message" and c2obj["role"] == "assistant")
+    check("compat json: text block translated", any(b["type"] == "text" and b["text"] == "Here you go." for b in c2obj["content"]))
+    check("compat json: tool_use block translated",
+          any(b["type"] == "tool_use" and b["name"] == "search" and b["input"]["q"] == "dogs" for b in c2obj["content"]))
+    check("compat json: stop_reason mapped to tool_use", c2obj["stop_reason"] == "tool_use")
+    check("compat json: usage mapped to input/output tokens",
+          c2obj["usage"]["input_tokens"] == 5 and c2obj["usage"]["output_tokens"] == 9)
+
+    # 5c. unmapped model passes through unchanged.
+    _post(compat_port, "/v1/messages",
+          {"model": "some-unmapped-model", "messages": [{"role": "user", "content": "hi"}]},
+          {"x-api-key": "sk-3"})
+    time.sleep(0.06)
+    check("compat: unmapped model passes through", STATE["lastChat"]["model"] == "some-unmapped-model")
 
     print(f"\nAll {passed} checks passed.")
     mock.shutdown()
