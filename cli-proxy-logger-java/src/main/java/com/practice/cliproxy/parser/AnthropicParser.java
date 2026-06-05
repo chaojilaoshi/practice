@@ -80,6 +80,9 @@ public class AnthropicParser extends AbstractWireParser {
         return new Agg();
     }
 
+    // Anthropic 把响应流式成一连串带 index 的「内容块（content block）」，每块要么是
+    // 文本要么是 tool_use，其内容分多次到达。因此一切按块的 index 归组：在
+    // content_block_start 开块、content_block_delta 追加片段、content_block_stop 收尾。
     private class Agg implements StreamAggregator {
         private final NormalizedResponse res = new NormalizedResponse();
         private final Map<Integer, Block> blocks = new HashMap<>();
@@ -96,9 +99,12 @@ public class AnthropicParser extends AbstractWireParser {
             }
             switch (type) {
                 case "message_start":
+                    // 流的第一个事件，携带初始 usage 计数。
                     res.usage = toObject(data.path("message").get("usage"));
                     break;
                 case "content_block_start": {
+                    // 新块开启。tool_use 的 id+name 此时已知；参数 JSON 稍后以
+                    // partial_json 片段流式到达。
                     JsonNode cb = data.path("content_block");
                     Block b = new Block();
                     b.type = cb.path("type").asText("");
@@ -108,6 +114,8 @@ public class AnthropicParser extends AbstractWireParser {
                     break;
                 }
                 case "content_block_delta": {
+                    // 已开块的增量：要么是正文，要么是工具参数 JSON 字符串的一个
+                    // 片段（先拼接，收尾时再整体解析）。
                     JsonNode d = data.path("delta");
                     String dt = d.path("type").asText("");
                     if ("text_delta".equals(dt)) {
@@ -121,6 +129,8 @@ public class AnthropicParser extends AbstractWireParser {
                     break;
                 }
                 case "content_block_stop": {
+                    // 块结束。若是工具调用，累积的 argText 此时已是完整 JSON ->
+                    // 解析成最终 ToolCall。
                     Block b = blocks.get(data.path("index").asInt());
                     if (b != null && "tool_use".equals(b.type)) {
                         res.toolCalls.add(new ToolCall(b.id, b.name, parseToolArgs(b.argText.toString())));

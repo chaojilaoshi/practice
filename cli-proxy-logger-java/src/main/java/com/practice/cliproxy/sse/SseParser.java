@@ -30,6 +30,9 @@ public class SseParser {
     }
 
     public void push(String text) {
+        // 追加新文本后逐个剥出完整事件。由于网络按任意字节边界切块，一个事件可能
+        // 被拆在两次 push 之间——所以末尾「可能不完整」的片段始终留在 buf 里等下次。
+        // 这正是「增量解析」的精髓：绝不假设某块数据恰好落在事件边界上。
         buf.append(text.replace("\r\n", "\n"));
         int idx;
         // 事件之间以空行（\n\n）分隔。

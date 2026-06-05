@@ -92,6 +92,10 @@ public class OpenAiChatParser extends AbstractWireParser {
         return new Agg();
     }
 
+    // Chat Completions 流式发出「chunk」，其 choices[].delta 携带增量内容。与 Responses
+    // API 不同，这里没有按工具的事件：一个工具调用被拆散在多个 chunk 中，仅靠位置
+    // tool_calls[].index 标识。因此按 index 累积 name+arguments——某 index 的首个 chunk
+    // 带 id+name，其余 chunk 带参数片段。"[DONE]" 是流终止哨兵，不是 JSON。
     private class Agg implements StreamAggregator {
         private final NormalizedResponse res = new NormalizedResponse();
         private final TreeMap<Integer, Call> calls = new TreeMap<>();
@@ -122,6 +126,7 @@ public class OpenAiChatParser extends AbstractWireParser {
                 res.textBuilder.append(delta.path("content").asText(""));
             }
             for (JsonNode tc : delta.path("tool_calls")) {
+                // 按 index 归组：首见即开槽，之后合并 id/name 并追加参数片段。
                 int idx = tc.path("index").asInt(0);
                 Call c = calls.computeIfAbsent(idx, k -> new Call());
                 if (tc.path("id").isTextual()) {

@@ -57,6 +57,12 @@ export function parseResponse(body) {
   return res;
 }
 
+// Chat Completions streams "chunks" whose choices[].delta carries partial
+// content. Unlike the Responses API there is no per-tool event: a tool call is
+// split across many chunks and identified only by its position via
+// tool_calls[].index. So we accumulate name+arguments per `index` — the first
+// chunk for an index carries id+name, the rest carry argument fragments.
+// "[DONE]" is the stream terminator sentinel, not JSON.
 export function createStreamAggregator() {
   const res = emptyResponse();
   const calls = new Map(); // index -> { id, name, argText }
@@ -71,8 +77,10 @@ export function createStreamAggregator() {
     if (!choice) return;
     if (choice.finish_reason) res.stopReason = choice.finish_reason;
     const delta = choice.delta || {};
-    if (typeof delta.content === 'string') res.text += delta.content;
+    if (typeof delta.content === 'string') res.text += delta.content; // prose
     for (const tc of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+      // Group by index: open the slot on first sight, then merge id/name and
+      // append argument fragments as later chunks arrive.
       const idx = tc.index ?? 0;
       let c = calls.get(idx);
       if (!c) {

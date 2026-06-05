@@ -73,6 +73,11 @@ export function parseResponse(body) {
 }
 
 // Stateful aggregator for streamed events.
+//
+// Anthropic streams a response as a sequence of indexed "content blocks". A
+// block is either text or a tool_use, and its payload arrives in pieces. So we
+// key everything by the block `index`: open a block on content_block_start,
+// append its fragments on content_block_delta, finalize on content_block_stop.
 export function createStreamAggregator() {
   const res = emptyResponse();
   const blocks = new Map(); // index -> { type, name, id, argText }
@@ -83,14 +88,19 @@ export function createStreamAggregator() {
     if (!data) return;
     switch (type) {
       case 'message_start':
+        // First event of the stream; carries the initial usage counters.
         if (data.message?.usage) res.usage = data.message.usage;
         break;
       case 'content_block_start': {
+        // A new block opens. For a tool_use we already know id+name here; the
+        // arguments JSON will stream in later as partial_json fragments.
         const cb = data.content_block || {};
         blocks.set(data.index, { type: cb.type, name: cb.name, id: cb.id, argText: '' });
         break;
       }
       case 'content_block_delta': {
+        // Incremental payload for an open block: prose, or a fragment of the
+        // tool-argument JSON string (concatenated, parsed once at stop).
         const b = blocks.get(data.index);
         const d = data.delta || {};
         if (d.type === 'text_delta') res.text += d.text ?? '';
@@ -98,6 +108,8 @@ export function createStreamAggregator() {
         break;
       }
       case 'content_block_stop': {
+        // Block complete. If it was a tool call, the accumulated argText is now
+        // a full JSON object -> parse it into the final ToolCall.
         const b = blocks.get(data.index);
         if (b && b.type === 'tool_use') {
           res.toolCalls.push({ id: b.id, name: b.name, args: parseToolArgs(b.argText) });

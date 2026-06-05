@@ -38,6 +38,10 @@ import java.util.UUID;
 @RestController
 public class ProxyController {
 
+    // 「逐跳（hop-by-hop）」头只对单个传输连接有意义（RFC 7230 6.1），代理不能
+    // 原样转发。这里还顺带去掉 host/content-length（为新连接重新计算）、
+    // transfer-encoding（由 HttpURLConnection 重新分帧）、以及 accept-encoding
+    // ——不带它就让 HttpURLConnection 自行协商 gzip 并透明解压，读到的即 identity。
     private static final Set<String> HOP_BY_HOP = Set.of(
             "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
             "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length", "accept-encoding");
@@ -57,8 +61,12 @@ public class ProxyController {
     @RequestMapping("/v1/**")
     public void proxy(HttpServletRequest req, HttpServletResponse resp) throws Exception {
         long started = System.currentTimeMillis();
+        // 步骤 1：缓冲请求体。CLI 的请求体是一段完整 JSON，整体读入最简单。
         byte[] reqBody = req.getInputStream().readAllBytes();
 
+        // 步骤 2：按路径选真实上游与 wire 格式。路径即可判断来源：
+        //   /v1/messages == Claude Code（Anthropic）；
+        //   /v1/responses 或 /v1/chat/completions == Codex。
         String path = req.getRequestURI();
         String query = req.getQueryString();
         UpstreamResolver.Upstream up = resolver.resolve(path, req.getHeader("x-api-key"), req.getHeader("anthropic-version"));
@@ -74,6 +82,9 @@ public class ProxyController {
         ex.requestBodyRaw = truncate(reqBody);
         ex.request = parser.parseRequest(new String(reqBody, StandardCharsets.UTF_8));
 
+        // 步骤 3+4：建立到上游的连接，并原样转发客户端请求头（含真实的
+        // Authorization / x-api-key），让上游看到与原始 CLI 完全一致的请求——
+        // 这也是为何上游针对 CLI 特有请求头的放行逻辑透过代理依然成立。
         HttpURLConnection conn = (HttpURLConnection) new URL(ex.url).openConnection();
         conn.setInstanceFollowRedirects(false);
         conn.setRequestMethod(req.getMethod());
@@ -98,10 +109,13 @@ public class ProxyController {
             resp.getWriter().write("{\"error\":{\"type\":\"proxy_error\",\"message\":\"" + e.getMessage() + "\"}}");
             return;
         }
+        // 步骤 5：把上游状态码与响应头回写给客户端（去掉逐跳头）。
         ex.resStatus = status;
         resp.setStatus(status);
         ex.resHeaders = copyResponseHeaders(conn, resp);
 
+        // 步骤 6 准备：SSE 流式响应走增量解析器 + 按 wire 的聚合器重建文本与
+        // 工具调用；非流式则缓冲整段字节，最后一次性解析。
         String contentType = conn.getContentType();
         boolean sse = contentType != null && contentType.contains("text/event-stream");
 
@@ -114,13 +128,16 @@ public class ProxyController {
         SseParser sseParser = sse ? new SseParser(agg::feed) : null;
         ByteArrayOutputStream copy = sse ? null : new ByteArrayOutputStream();
 
+        // 步骤 6：双路转发循环。每读到一块上游数据，先把「原始字节」回写给
+        // CLI（保真优先：即便解析抛错也不影响 CLI），再把同一份喂给 SSE 解析器
+        // 或缓冲区。
         OutputStream clientOut = resp.getOutputStream();
         byte[] buf = new byte[8192];
         int n;
         try {
             while ((n = upstream.read(buf)) != -1) {
                 clientOut.write(buf, 0, n);   // 保真：先原样回写给 CLI
-                clientOut.flush();
+                clientOut.flush();            // flush 让 SSE 实时到达
                 if (sse) {
                     sseParser.push(new String(buf, 0, n, StandardCharsets.UTF_8));
                 } else if (copy.size() < props.getMaxBodyBytes()) {
@@ -133,9 +150,10 @@ public class ProxyController {
             upstream.close();
         }
 
+        // 步骤 7：收尾——得到归一化响应并记录这条 Exchange。
         try {
             if (sse) {
-                sseParser.flush();
+                sseParser.flush();   // 冲出缓冲区里残留的最后一个事件
                 ex.response = agg.result();
             } else {
                 ex.response = parser.parseResponse(copy.toString(StandardCharsets.UTF_8));
@@ -149,6 +167,8 @@ public class ProxyController {
         recorder.record(ex);
     }
 
+    // 落盘前对凭证脱敏：转发给上游的仍是真实 key，只有写入日志的副本被打码，
+    // 因此 JSONL 文件里不会出现可用的 API key。
     private Map<String, String> collectRequestHeaders(HttpServletRequest req) {
         Map<String, String> out = new LinkedHashMap<>();
         Enumeration<String> names = req.getHeaderNames();

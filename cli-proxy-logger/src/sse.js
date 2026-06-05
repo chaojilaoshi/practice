@@ -28,11 +28,17 @@ export class SSEParser {
   }
 
   push(text) {
+    // Append the new text and peel off complete events. Because the network
+    // delivers arbitrary byte boundaries, an event may be split across two
+    // push() calls — so we always retain the trailing, possibly incomplete,
+    // fragment in this._buf for next time. That is the essence of "incremental"
+    // parsing: never assume a chunk ends on an event boundary.
     this._buf += text;
     // SSE events are separated by a blank line. Handle \n\n and \r\n\r\n.
     const normalized = this._buf.replace(/\r\n/g, '\n');
     const parts = normalized.split('\n\n');
-    // Keep the last (possibly incomplete) chunk in the buffer.
+    // The last element is whatever came after the final blank line; it may be
+    // a partial event, so put it back in the buffer.
     this._buf = parts.pop() ?? '';
     for (const block of parts) {
       if (block.trim() === '') continue;

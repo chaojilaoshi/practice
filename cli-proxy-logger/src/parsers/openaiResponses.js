@@ -67,6 +67,10 @@ export function parseResponse(body) {
   return res;
 }
 
+// The Responses API streams "semantic" events that already name what is
+// happening (response.output_item.added, ...function_call_arguments.delta, ...).
+// Each output item has a stable item_id, so we accumulate tool-call arguments
+// per item_id and emit the ToolCall when the item is done.
 export function createStreamAggregator() {
   const res = emptyResponse();
   const calls = new Map(); // item_id -> { id, name, call_id, argText }
@@ -79,6 +83,7 @@ export function createStreamAggregator() {
     const type = evt.event || data.type;
     switch (type) {
       case 'response.output_item.added': {
+        // A new output item appears; remember it if it's a function call.
         const item = data.item || {};
         if (item.type === 'function_call') {
           calls.set(item.id ?? data.item_id, { id: item.call_id ?? item.id, name: item.name, argText: '' });
@@ -86,16 +91,20 @@ export function createStreamAggregator() {
         break;
       }
       case 'response.function_call_arguments.delta': {
+        // Argument JSON streams in as fragments -> concatenate by item_id.
         const c = calls.get(data.item_id);
         if (c) c.argText += data.delta ?? '';
         break;
       }
       case 'response.function_call_arguments.done': {
+        // Some servers send the full arguments here instead of deltas; use it
+        // only as a fallback when we never received any delta fragments.
         const c = calls.get(data.item_id);
         if (c && data.arguments !== undefined && c.argText === '') c.argText = data.arguments;
         break;
       }
       case 'response.output_item.done': {
+        // Item finished -> finalize the tool call (parse accumulated args).
         const item = data.item || {};
         if (item.type === 'function_call') {
           const c = calls.get(item.id ?? data.item_id) || { id: item.call_id ?? item.id, name: item.name, argText: item.arguments ?? '' };

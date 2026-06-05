@@ -80,6 +80,9 @@ public class OpenAiResponsesParser extends AbstractWireParser {
         return new Agg();
     }
 
+    // Responses API 流式发出「语义事件」，事件名本身已说明在发生什么
+    // （response.output_item.added、...function_call_arguments.delta ...）。每个输出
+    // 项有稳定的 item_id，因此按 item_id 累积工具调用参数，待该项 done 时产出 ToolCall。
     private class Agg implements StreamAggregator {
         private final NormalizedResponse res = new NormalizedResponse();
         private final Map<String, Call> calls = new HashMap<>();
@@ -90,12 +93,14 @@ public class OpenAiResponsesParser extends AbstractWireParser {
             if (data == null) {
                 return;
             }
+            // 事件名可能在 SSE 的「event:」行，也可能在 JSON 的 type 字段。
             String type = evt.event != null ? evt.event : data.path("type").asText(null);
             if (type == null) {
                 return;
             }
             switch (type) {
                 case "response.output_item.added": {
+                    // 新输出项出现；若是函数调用就记下它。
                     JsonNode item = data.path("item");
                     if ("function_call".equals(item.path("type").asText(""))) {
                         Call c = new Call();
@@ -106,6 +111,7 @@ public class OpenAiResponsesParser extends AbstractWireParser {
                     break;
                 }
                 case "response.function_call_arguments.delta": {
+                    // 参数 JSON 以片段流入 -> 按 item_id 拼接。
                     Call c = calls.get(data.path("item_id").asText(null));
                     if (c != null) {
                         c.argText.append(data.path("delta").asText(""));
@@ -113,6 +119,8 @@ public class OpenAiResponsesParser extends AbstractWireParser {
                     break;
                 }
                 case "response.function_call_arguments.done": {
+                    // 有些服务端在这里一次性给出完整 arguments 而非 delta；仅当从未
+                    // 收到任何 delta 片段时才用它兜底。
                     Call c = calls.get(data.path("item_id").asText(null));
                     if (c != null && c.argText.length() == 0 && data.has("arguments")) {
                         c.argText.append(data.path("arguments").asText(""));
@@ -120,6 +128,7 @@ public class OpenAiResponsesParser extends AbstractWireParser {
                     break;
                 }
                 case "response.output_item.done": {
+                    // 该项结束 -> 产出工具调用（解析累积的参数）。
                     JsonNode item = data.path("item");
                     if ("function_call".equals(item.path("type").asText(""))) {
                         String key = item.path("id").asText(data.path("item_id").asText(null));
