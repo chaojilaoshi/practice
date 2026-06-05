@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>cli-proxy-logger (py)</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --border:#272b36; --fg:#e6e6e6; --muted:#8b93a7;
+          --accent:#6ea8fe; --tool:#f0a35e; --err:#ff6b6b; --ok:#5ad17f; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+         background:var(--bg); color:var(--fg); height:100vh; display:flex; flex-direction:column; }
+  header { padding:8px 14px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px; }
+  header h1 { font-size:14px; margin:0; font-weight:600; }
+  header .muted { color:var(--muted); }
+  #main { flex:1; display:flex; min-height:0; }
+  #list { width:42%; max-width:560px; overflow:auto; border-right:1px solid var(--border); }
+  #detail { flex:1; overflow:auto; padding:14px; }
+  .row { padding:8px 12px; border-bottom:1px solid var(--border); cursor:pointer; }
+  .row:hover { background:#1c2029; }
+  .row.sel { background:#222838; }
+  .row .top { display:flex; gap:8px; align-items:center; }
+  .badge { font-size:11px; padding:1px 6px; border-radius:4px; background:#222838; color:var(--muted); }
+  .badge.anthropic { color:#d6a4ff; } .badge.responses { color:#7fd1ff; } .badge.chat { color:#9affc1; }
+  .status-2 { color:var(--ok); } .status-4, .status-5 { color:var(--err); }
+  .tool { color:var(--tool); }
+  .muted { color:var(--muted); }
+  .row .sub { color:var(--muted); font-size:12px; margin-top:2px; }
+  pre { background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:10px;
+        overflow:auto; white-space:pre-wrap; word-break:break-word; max-height:380px; }
+  h3 { margin:18px 0 6px; font-size:13px; color:var(--accent); }
+  .kv { color:var(--muted); }
+  .toolcall { border:1px solid var(--tool); border-radius:6px; padding:8px; margin:6px 0; }
+  .toolcall .name { color:var(--tool); font-weight:600; }
+  .empty { color:var(--muted); padding:30px; text-align:center; }
+  button { background:#222838; color:var(--fg); border:1px solid var(--border); border-radius:4px;
+           padding:3px 10px; cursor:pointer; }
+  button:hover { background:#2a3142; }
+</style>
+</head>
+<body>
+<header>
+  <h1>cli-proxy-logger <span class="muted">(py)</span></h1>
+  <span class="muted" id="count"></span>
+  <button id="refresh">refresh</button>
+  <label class="muted"><input type="checkbox" id="auto" checked /> auto</label>
+</header>
+<div id="main">
+  <div id="list"></div>
+  <div id="detail"><div class="empty">Select a request on the left.</div></div>
+</div>
+<script>
+const listEl = document.getElementById('list');
+const detailEl = document.getElementById('detail');
+const countEl = document.getElementById('count');
+let selected = null;
+
+function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function statusClass(s){ return 'status-' + String(s).charAt(0); }
+
+async function loadList(){
+  const res = await fetch('/api/exchanges?limit=200');
+  const items = await res.json();
+  countEl.textContent = items.length + ' requests';
+  listEl.innerHTML = '';
+  for (const it of items){
+    const div = document.createElement('div');
+    div.className = 'row' + (it.id === selected ? ' sel' : '');
+    const tools = (it.toolCallNames||[]).length
+      ? ' <span class="tool">&#128296; ' + it.toolCallNames.map(esc).join(', ') + '</span>' : '';
+    const err = it.error ? ' <span class="status-5">ERR</span>' : '';
+    div.innerHTML =
+      '<div class="top"><span class="badge '+it.wire+'">'+it.wire+'</span>'+
+      '<span class="'+statusClass(it.resStatus)+'">'+(it.resStatus||'-')+'</span>'+
+      '<span>'+esc(it.method)+'</span>'+
+      '<span class="muted">'+esc(it.model||'')+'</span>'+
+      (it.stream?' <span class="badge">stream</span>':'')+tools+err+'</div>'+
+      '<div class="sub">'+esc(new URL(it.url).pathname)+' &middot; '+it.durationMs+'ms &middot; '+esc(it.ts)+'</div>';
+    div.onclick = () => { selected = it.id; loadDetail(it.id); document.querySelectorAll('.row').forEach(r=>r.classList.remove('sel')); div.classList.add('sel'); };
+    listEl.appendChild(div);
+  }
+}
+
+function section(title, body){ return '<h3>'+title+'</h3>'+body; }
+function pre(obj){ return '<pre>'+esc(typeof obj==='string'?obj:JSON.stringify(obj,null,2))+'</pre>'; }
+
+async function loadDetail(id){
+  const res = await fetch('/api/exchanges/'+encodeURIComponent(id));
+  if(!res.ok){ detailEl.innerHTML = '<div class="empty">not found</div>'; return; }
+  const e = await res.json();
+  let html = '';
+  html += '<div><span class="badge '+e.wire+'">'+e.wire+'</span> '+
+          '<span class="'+statusClass(e.resStatus)+'">'+e.resStatus+'</span> '+
+          esc(e.method)+' '+esc(e.url)+' <span class="muted">('+e.durationMs+'ms)</span></div>';
+  if(e.error) html += '<div class="status-5">'+esc(e.error)+'</div>';
+
+  const tcs = (e.response && e.response.toolCalls) || [];
+  if(tcs.length){
+    let t = '';
+    for(const tc of tcs){
+      t += '<div class="toolcall"><span class="name">'+esc(tc.name)+'</span> '+
+           '<span class="kv">'+esc(tc.id||'')+'</span>'+pre(tc.args)+'</div>';
+    }
+    html += section('Tool calls ('+tcs.length+')', t);
+  }
+  if(e.response && e.response.text) html += section('Assistant text', pre(e.response.text));
+  html += section('Request (parsed)', pre(e.request));
+  html += section('Response (parsed)', pre(e.response));
+  html += section('Request headers', pre(e.reqHeaders));
+  html += section('Request body (raw)', pre(e.requestBodyRaw));
+  html += section('Response headers', pre(e.resHeaders));
+  detailEl.innerHTML = html;
+}
+
+document.getElementById('refresh').onclick = loadList;
+setInterval(()=>{ if(document.getElementById('auto').checked) loadList(); }, 2000);
+loadList();
+</script>
+</body>
+</html>
