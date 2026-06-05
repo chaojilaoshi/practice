@@ -1,0 +1,27 @@
+# systemd 服务模板（Python 版）。用法：
+#   1) 把本工程解压到 /opt/cli-proxy-logger-py（或改下面的路径）
+#   2) 按需改 Environment 里的端口/上游/日志目录
+#   3) sudo cp deploy/cli-proxy-logger.service /etc/systemd/system/cli-proxy-logger-py.service
+#   4) sudo systemctl daemon-reload && sudo systemctl enable --now cli-proxy-logger-py
+#   查看日志：journalctl -u cli-proxy-logger-py -f
+[Unit]
+Description=cli-proxy-logger (Python) - local LLM proxy logger
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cli-proxy-logger-py
+# python3 的绝对路径按实际改（which python3）。-m 从包目录启动。
+ExecStart=/usr/bin/python3 -m cli_proxy_logger
+Restart=on-failure
+RestartSec=2
+# —— 可选环境变量（去掉注释即可生效）——
+Environment=PROXY_PORT=8788
+Environment=UI_PORT=8789
+Environment=LOG_DIR=/var/log/cli-proxy-logger
+Environment=OPENAI_UPSTREAM=https://api.openai.com
+Environment=ANTHROPIC_UPSTREAM=https://api.anthropic.com
+# User=cliproxy
+
+[Install]
+WantedBy=multi-user.target

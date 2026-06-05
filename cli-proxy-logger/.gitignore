@@ -1,0 +1,6 @@
+node_modules/
+dist/
+logs/
+logs-*/
+*.log
+test/.tmp-logs/

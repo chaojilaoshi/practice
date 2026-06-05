@@ -1,0 +1,23 @@
+# 外置配置样例：把本文件改名为 application.yml，放在 jar 的同级目录，
+# Spring Boot 启动时会自动读取并覆盖 jar 内打包的默认配置（无需重新打包）。
+# 也可以用命令行参数覆盖，例如：java -jar xxx.jar --server.port=9000
+server:
+  # 代理 + Web UI 共用端口（Claude Code / Codex 的 base URL 指向这里）。
+  port: 8788
+  # 内网安全：默认监听所有网卡。若只想本机访问，取消下一行注释。
+  # address: 127.0.0.1
+
+proxy:
+  # 上游真实 API（按内网可达的地址改）。
+  anthropic-upstream: https://api.anthropic.com
+  openai-upstream: https://api.openai.com
+  # JSONL 日志目录（相对启动 cwd，或写绝对路径，如 /var/log/cli-proxy-logger）。
+  log-dir: ./logs
+  # 落盘日志时把 x-api-key / authorization 脱敏（转发给上游的仍是真实 key）。
+  redact-auth: true
+  # 单条 body 落盘上限（字节），超出截断。
+  max-body-bytes: 2000000
+
+logging:
+  level:
+    root: info

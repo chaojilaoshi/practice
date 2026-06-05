@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.practice</groupId>
+    <artifactId>cli-proxy-logger</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+    <name>cli-proxy-logger</name>
+    <description>本地反向代理，拦截并记录 Claude Code / Codex 的请求/响应/工具调用（学习用 Spring Boot 版）</description>
+
+    <!--
+        与 generic-invoke 保持一致的技术选型：
+        Spring Boot 2.6.13（仅用 spring-boot-starter-web，Servlet 阻塞式 I/O，便于理解流式转发）
+        JSON 解析复用 spring-boot-starter-web 自带的 Jackson
+    -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>2.6.13</version>
+        <relativePath/>
+    </parent>
+
+    <properties>
+        <java.version>8</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

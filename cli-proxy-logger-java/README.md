@@ -1,0 +1,271 @@
+# cli-proxy-logger（Spring Boot 学习版）
+
+与 [`../cli-proxy-logger`](../cli-proxy-logger)（Node 实际使用版）**功能等价**的 Java/Spring Boot 实现，用来学习「如何用 Servlet 阻塞式 I/O 做一个流式反向代理并解析 LLM 工具调用」。
+
+本地反向代理，拦截并记录 Claude Code / Codex 的全部 LLM API 请求——请求/响应参数、以及调用了哪个工具、参数是什么。不劫持 TLS、不装根证书。
+
+代理与 Web UI **共用一个端口（默认 8788）**：
+
+```
+Claude Code / Codex ──HTTP──▶ :8788  ──HTTPS──▶ api.anthropic.com / api.openai.com
+                                │
+                                ├─ /v1/**         代理 + 解析（ProxyController）
+                                ├─ /api/exchanges 查询接口（ExchangeApiController）
+                                └─ /              Web UI（static/index.html）
+```
+
+## 运行
+
+需要 **JDK 8 及以上**、Maven。本工程刻意用 Java 8 兼容写法（`pom.xml` 里 `java.version=8`），所以 **JDK 8 / 11 / 17 都能编译运行**——内网常见的 JDK 8 也 OK（已用 Temurin 1.8.0_492 实测：编译产物为 Java 8 字节码、`java -jar` 启动、端到端代理+解析+落盘全通过）。
+
+```bash
+cd cli-proxy-logger-java
+mvn spring-boot:run
+# 或： mvn -q package && java -jar target/cli-proxy-logger-1.0.0.jar
+```
+
+打开 http://127.0.0.1:8788/ 浏览抓到的请求。
+
+> **关于 JDK 版本**：默认 `java.version=8`（最大兼容内网环境）。如果你的环境是 JDK 11/17 且想用更高字节码，把 `pom.xml` 的 `<java.version>` 改成 `11` 或 `17` 即可，代码无需改动（未使用任何 Java 9+ 专有 API）。
+
+## 使用配置模板（Codex / Claude Code / opencode）
+
+与 Node 版完全一致，只是本版代理 + UI **共用 8788**。把各 CLI 的 base URL 指向本地代理即可。**最关键的区别：Codex / opencode 的 base URL 带 `/v1`；Claude Code 的不带 `/v1`**（它自己会拼 `/v1/messages`，带了会变成 `/v1/v1/messages` 而 404）。
+
+代理按路径区分上游：`/v1/responses` 与 `/v1/chat/completions` 走 `proxy.openai-upstream`，`/v1/messages` 走 `proxy.anthropic-upstream`（见本节末「启动代理时设置上游」）。
+
+### Codex（`~/.codex/config.toml`）
+
+**场景 A：自定义 provider（推荐，可与官方 OpenAI 配置共存）**
+```toml
+model = "gpt-5"
+model_provider = "proxy"
+
+[model_providers.proxy]
+name = "local proxy"            # 必填，否则报 "provider name must not be empty"
+base_url = "http://127.0.0.1:8788/v1"
+wire_api = "responses"          # Codex 默认走 Responses；兼容 API 可设 "chat"
+env_key = "OPENAI_API_KEY"      # key 走环境变量时需要；若用 auth.json 则删掉这行
+```
+
+**场景 B：直接改内置 openai provider 的 base URL（最省事）**
+```toml
+openai_base_url = "http://127.0.0.1:8788/v1"
+```
+
+**key 的两种提供方式（二选一）：**
+- 环境变量：provider 块保留 `env_key = "OPENAI_API_KEY"`，启动前设好 `set OPENAI_API_KEY=<key>`（PowerShell：`$env:OPENAI_API_KEY="<key>"`）。
+- `~/.codex/auth.json`：写 `{ "OPENAI_API_KEY": "<key>" }`，并**删掉** provider 块里的 `env_key`（否则 Codex 强制找环境变量，报 `Missing environment variable: OPENAI_API_KEY`）。
+
+**wire 区别：** `wire_api = "responses"` → `POST /v1/responses`（Codex 默认，流式）；`wire_api = "chat"` → `POST /v1/chat/completions`。
+
+### Claude Code（环境变量）
+
+```bash
+# base URL 不带 /v1！Claude Code 自己拼 /v1/messages
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
+export ANTHROPIC_API_KEY=<key>          # 以 x-api-key 头发出，代理原样转发、落盘脱敏
+# 指向非官方 host 时 MCP tool search 默认关闭，需要可开启：
+# export ENABLE_TOOL_SEARCH=true
+
+# 模型分三档：opus / sonnet / haiku。接第三方上游时建议显式指定，
+# 否则别名会解析成 Anthropic 官方模型名，上游不一定认。
+export ANTHROPIC_MODEL=<主模型>                       # 覆盖当前会话主模型
+export ANTHROPIC_DEFAULT_OPUS_MODEL=<opus 档模型>     # /model 切到 opus 时解析到的模型
+export ANTHROPIC_DEFAULT_SONNET_MODEL=<sonnet 档模型> # /model 切到 sonnet 时解析到的模型
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=<haiku 档模型>   # haiku 档 + 后台任务（标题/补全等）
+claude
+```
+Windows 用 `$env:NAME="..."`（PowerShell）或 `set NAME=...`（cmd）。
+
+模型说明：
+- `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL` 分别控制三档别名解析到的真实模型；`ANTHROPIC_MODEL` 覆盖「当前主模型」（优先级高于 `model` 设置）。
+- 旧版的 `ANTHROPIC_SMALL_FAST_MODEL` 已被 `ANTHROPIC_DEFAULT_HAIKU_MODEL` 取代（仍向后兼容，对应 haiku/后台档）。
+- **后台任务**（生成会话标题等）默认走 haiku 档，所以即便你只用 sonnet，也建议把 `ANTHROPIC_DEFAULT_HAIKU_MODEL` 指到一个上游可用的小模型，否则后台请求可能报错。
+- 实测（freemodel）：`ANTHROPIC_MODEL=claude-sonnet-4-6` + `ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5-20251001` 可用。
+
+### opencode（`opencode.json` 或 `~/.config/opencode/opencode.json`）
+
+opencode 支持「每个 provider 自定义 `baseURL`」，底层就是本工具已覆盖的三种 wire 格式，base URL **带 `/v1`**。三种场景按 `npm` 包区分：
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    // 场景①：OpenAI 兼容 -> /v1/chat/completions -> chat wire
+    "myproxy-chat": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local proxy (chat)",
+      "options": { "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "<key>" },
+      "models": { "gpt-5": { "name": "gpt-5 via proxy (chat)" } }
+    },
+    // 场景②：OpenAI Responses -> /v1/responses -> responses wire
+    "myproxy-resp": {
+      "npm": "@ai-sdk/openai",
+      "name": "Local proxy (responses)",
+      "options": { "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "<key>" },
+      "models": { "gpt-5": { "name": "gpt-5 via proxy (responses)" } }
+    },
+    // 场景③：Anthropic 模型 -> /v1/messages -> anthropic wire（覆盖内置 anthropic 的 baseURL）
+    "anthropic": {
+      "options": { "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "<key>" }
+    }
+  }
+}
+```
+跑：`opencode run -m myproxy-chat/gpt-5 "..."`（或 `myproxy-resp/...`、`anthropic/...`）。chat / responses 路径都抓到工具调用参数与请求/响应体；anthropic 路径也被正确路由落盘（若上游按 CLI 指纹放行——如只认 Claude Code——可能拒绝 opencode，属上游限制，与代理无关）。
+
+### 启动代理时设置上游
+
+本版上游用 `proxy.*` 配置（默认 `https://api.openai.com` / `https://api.anthropic.com`）。指向 freemodel 的两种写法：
+
+```bash
+# 命令行参数
+mvn spring-boot:run -Dspring-boot.run.arguments="--proxy.openai-upstream=https://api.freemodel.dev --proxy.anthropic-upstream=https://cc.freemodel.dev"
+
+# 或环境变量（Spring Boot relaxed binding）
+PROXY_OPENAI_UPSTREAM=https://api.freemodel.dev PROXY_ANTHROPIC_UPSTREAM=https://cc.freemodel.dev mvn spring-boot:run
+```
+也可直接写进 `application.yml` 的 `proxy.openai-upstream` / `proxy.anthropic-upstream`。
+
+## 配置（application.yml，前缀 `proxy.*`）
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `server.port` | `8788` | 代理 + UI 端口 |
+| `proxy.anthropic-upstream` | `https://api.anthropic.com` | Anthropic 上游 |
+| `proxy.openai-upstream` | `https://api.openai.com` | OpenAI 上游 |
+| `proxy.log-dir` | `./logs` | JSONL 日志目录 |
+| `proxy.redact-auth` | `true` | 落盘时脱敏 `x-api-key`/`authorization` |
+| `proxy.max-body-bytes` | `2000000` | 单条 body 落盘上限 |
+| `proxy.anthropic-compat` | 空（透明直通） | 设为 `chat` 时开启「协议翻译」：把进来的 Anthropic `/v1/messages` 翻译成 OpenAI `/v1/chat/completions` 发往 `proxy.openai-upstream`（见下一节） |
+| `proxy.model-map` | 空 | 模型映射表，JSON（`{"claude-sonnet-4-6":"gpt-4o"}`）或逗号分隔（`claude-sonnet-4-6=gpt-4o,claude-haiku-4-5=gpt-4o-mini`）；没命中就原样透传模型名 |
+| `proxy.model-map-file` | 空 | 模型映射 JSON 文件路径（优先于 `proxy.model-map`） |
+
+> 这几项都支持环境变量（Spring relaxed binding）：`PROXY_ANTHROPIC_COMPAT` / `PROXY_MODEL_MAP` / `PROXY_MODEL_MAP_FILE`；为与 Node/Python 版保持一致，也兼容裸的 `ANTHROPIC_COMPAT` / `MODEL_MAP` / `MODEL_MAP_FILE`。
+
+## 协议翻译：让只支持 `/v1/chat/completions` 的厂商也能跑 Claude Code
+
+**场景**：有的第三方厂商/路由**只认 OpenAI `/v1/chat/completions`**，不支持 Anthropic `/v1/messages`。而 Claude Code（以及 opencode 的 anthropic provider）只会说 Anthropic 协议。开启**协议翻译**后，代理在中间做格式转换，Claude Code 端**完全无感**。
+
+> 默认是**透明直通**（不翻译，原样转发）。翻译是 **opt-in**，只有设了 `proxy.anthropic-compat=chat`（或 `ANTHROPIC_COMPAT=chat`）才开启，且只作用于 `/v1/messages`；其它路径（`/v1/responses`、`/v1/chat/completions`）仍透明转发。
+
+**开启方式**
+```bash
+# 命令行参数
+mvn spring-boot:run -Dspring-boot.run.arguments="\
+  --proxy.anthropic-compat=chat \
+  --proxy.openai-upstream=https://only-chat-vendor.example.com \
+  --proxy.model-map={\"claude-sonnet-4-6\":\"gpt-4o\",\"claude-haiku-4-5\":\"gpt-4o-mini\"}"
+# 或环境变量（等价）
+ANTHROPIC_COMPAT=chat \
+PROXY_OPENAI_UPSTREAM=https://only-chat-vendor.example.com \
+MODEL_MAP='{"claude-sonnet-4-6":"gpt-4o","claude-haiku-4-5":"gpt-4o-mini"}' \
+java -jar target/cli-proxy-logger-1.0.0.jar
+```
+然后 Claude Code 照常配置（base URL 指向代理、`x-api-key` 带 key）即可，代理会自动把它翻译成 chat 请求发往上游。
+
+**客户端 Claude Code 配置（已用真实「只支持 chat 的厂商」实测）**
+
+客户端全用环境变量配置（代理这侧按上面「开启方式」把 `proxy.openai-upstream` / `PROXY_OPENAI_UPSTREAM` 指向只认 `/v1/chat/completions` 的厂商）：
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8788              # 不带 /v1，Claude Code 自己拼 /v1/messages
+export ANTHROPIC_API_KEY=<上游厂商的 key>                     # 以 x-api-key 发出，代理原样转发给上游
+export ANTHROPIC_MODEL=claude-sonnet-4-6                     # 主模型；按 model-map → 上游 gpt-4o
+export ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4-5-20251001  # 后台小/快模型；按 model-map → gpt-4o-mini
+claude
+```
+> **两个坑**：① 模型映射必须把 Claude Code 用到的**每个**模型名都映射到上游真实模型——尤其后台任务用的 **haiku 档**，漏了它那条后台请求会以原模型名透传、上游可能不认而报错；② `ANTHROPIC_BASE_URL` **不带 `/v1`**（与 Codex/opencode 相反），带了会变成 `/v1/v1/messages` 而 404。
+>
+> 实测（在 Node 版上端到端验证，三套翻译逻辑一致）：上游用 `https://api.freemodel.dev`（只支持 chat），映射 `claude-sonnet-4-6→gpt-4o`、`claude-haiku-4-5-20251001→gpt-4o-mini`，跑真实 Claude Code，`Read` 等工具调用全程正常；UI 里每条记录标 `anthropic` 但上游 URL 是 `…/v1/chat/completions`，即翻译生效。
+
+**翻译都做了什么**
+1. **请求**：Anthropic `/v1/messages` → OpenAI `/v1/chat/completions`：`system` → system 消息；content blocks（文本/图片）展开；`tool_use` → `tool_calls`、`tool_result` → `tool` 角色消息；`tools[].input_schema` → `function.parameters`；鉴权 `x-api-key: K` → `Authorization: Bearer K`。
+2. **模型映射**：按 `proxy.model-map`/`proxy.model-map-file` 把进来的模型名换成上游模型名（正好覆盖 Claude Code 的 opus/sonnet/haiku 三档）；没命中就原样透传。
+3. **响应（最难）**：把上游回来的 OpenAI chat **SSE 流**（`choices[].delta`、`delta.tool_calls[]` 按 index 聚合）**实时**翻译回 Anthropic 事件流（`message_start` / `content_block_start` / `content_block_delta`(`text_delta`、`input_json_delta`) / `content_block_stop` / `message_delta` / `message_stop`）；非流式则整包转一次，若客户端要的是流式还会把整包合成成 SSE 回放。`finish_reason` → `stop_reason`、`usage` 字段也做映射。
+4. **落盘**：翻译类请求在 JSONL 里带一个 `translation` 字段（`{from, to, model, upstreamModel}`），方便排查。
+
+> **模型映射文件示例**（`--proxy.model-map-file=./model-map.json`）：
+> ```json
+> { "claude-opus-4": "gpt-4o", "claude-sonnet-4-6": "gpt-4o", "claude-haiku-4-5": "gpt-4o-mini" }
+> ```
+
+## 内网打包与部署（离线）
+
+Java 版与 Node/Python 不同：它**有第三方依赖**（Spring Boot、内嵌 Tomcat、Jackson），内网机器无法从 Maven 中央仓库下载。所以**核心思路是：在能联网的机器上打成 fat jar（所有依赖打进单个 jar），再把 jar 拷到内网用 JRE 直接跑**。
+
+**步骤**
+1. **在联网机器构建 fat jar**（首次会从中央仓库拉依赖，所以必须联网）。可用一键打包脚本（会 `mvn package` 并把 jar + 样例 `application.yml` 放进 `dist/`）：
+   ```bash
+   bash scripts/package.sh                # Linux/macOS
+   # 或 Windows PowerShell：
+   powershell -ExecutionPolicy Bypass -File scripts\package.ps1
+   # 也可以手动：mvn -DskipTests package
+   ```
+   产物：`target/cli-proxy-logger-1.0.0.jar`（脚本会再拷一份到 `dist/`），本机实测约 **17 MB**，**已内嵌 Spring + Tomcat + Jackson + 本工程的静态 UI**，是一个自包含可执行 jar（`spring-boot-maven-plugin` 的 repackage 会自动做这件事）。
+2. **准备 JRE**：内网机器装 **JRE/JDK 8 及以上**（本工程默认 `java.version=8`，所以 JDK 8 即可；11/17 也行）。可用各厂商的离线包（Temurin/Adoptium、Zulu、Microsoft OpenJDK 等）。**不需要 Maven、不需要源码**——只要这一个 jar + JRE。注意：构建机的 JDK 版本要 **≥ 你设定的 `java.version`**（用 JDK 8 构建则产出 Java 8 字节码，能在 8/11/17 上跑；用 JDK 17 构建且 `java.version=8` 也能产出 Java 8 字节码）。
+3. **拷贝并运行**：把 `cli-proxy-logger-1.0.0.jar` 拷到内网，运行：
+   ```bash
+   java -jar cli-proxy-logger-1.0.0.jar
+   # 改端口 / 上游（命令行参数）：
+   java -jar cli-proxy-logger-1.0.0.jar --server.port=8788 \
+        --proxy.openai-upstream=https://内网网关/v1上游 \
+        --proxy.anthropic-upstream=https://内网网关/anthropic上游 \
+        --proxy.log-dir=/var/log/cli-proxy
+   # 或用环境变量：PROXY_OPENAI_UPSTREAM / PROXY_ANTHROPIC_UPSTREAM / PROXY_LOG_DIR / SERVER_PORT
+   ```
+   也可在 jar 同级目录放一个 `application.yml`（或 `./config/application.yml`），Spring Boot 启动时会自动加载并覆盖内置配置——内网改配置不用重新打包。
+4. **常驻后台**（可选，仓库已带模板）：
+   - **Linux（systemd）**：用 <code>deploy/cli-proxy-logger.service</code> 模板——把 jar 放到 `/opt/cli-proxy-logger-java/`，改好里面的 java 路径/端口/上游，`sudo cp` 到 `/etc/systemd/system/cli-proxy-logger-java.service`，再 `sudo systemctl enable --now cli-proxy-logger-java`。日志看 `journalctl -u cli-proxy-logger-java -f`。
+   - **Windows（nssm）**：用 <code>deploy/install-nssm.ps1</code>——装好 [nssm](https://nssm.cc/) 后以管理员 PowerShell 运行即可注册成开机自启服务（卸载：`nssm remove cli-proxy-logger-java confirm`）。
+   - 临时跑也行：Linux `nohup java -jar ... &`。
+
+> 仓库还附了 <code>deploy/application.yml.sample</code>（改名为 `application.yml` 放在 jar 同级目录即可覆盖配置，无需重新打包）。
+
+**如果必须在内网用 Maven 构建**（不推荐，麻烦）：在联网机器用 `mvn -DskipTests package dependency:go-offline` 预热本地仓库 `~/.m2/repository`，把整个 `.m2/repository` 拷到内网同路径，再用 `mvn -o package` 离线构建。直接拷 fat jar 更省事。
+
+> **网络/安全**：代理 + UI 共用一个端口（默认 `:8788`）。CLI 的 base URL 指向 `127.0.0.1`，**建议与 CLI 同机部署**。Spring Boot/Tomcat 默认会监听所有网卡，若只想本机可访问，加 `--server.address=127.0.0.1`，避免端口暴露到内网其他机器。
+
+## 代码结构（控制/数据流顺序）
+
+| 类 | 职责 |
+|----|------|
+| `proxy/UpstreamResolver` | 据请求路径选择上游 + wire 类型 |
+| `proxy/ProxyController` | `/v1/**`：转发字节 + 旁路解析 + 记录 |
+| `sse/SseParser` | 增量解析 SSE 事件 |
+| `parser/WireParser` + `AnthropicParser` / `OpenAiResponsesParser` / `OpenAiChatParser` | 三种 wire 的请求/响应/工具调用解析 |
+| `parser/StreamAggregator` | 流式聚合，重建文本 + 工具调用 |
+| `recorder/ExchangeRecorder` | 内存最近列表 + 按天 JSONL 落盘 |
+| `web/ExchangeApiController` | `/api/exchanges` 查询接口 + `DELETE /api/exchanges` 清空内存列表 |
+| `model/*` | 统一数据模型 `Exchange` / `NormalizedRequest` / `NormalizedResponse` / `ToolCall` |
+
+## 工具调用解析点
+
+| wire | 路径 | 解析点 |
+|------|------|--------|
+| `anthropic` | `/v1/messages` | SSE `content_block_start(tool_use)` + `input_json_delta`；非流式 `content[].tool_use` |
+| `responses` | `/v1/responses` | SSE `response.output_item.added(function_call)` + `function_call_arguments.delta`；非流式 `output[].function_call` |
+| `chat` | `/v1/chat/completions` | SSE `choices[].delta.tool_calls[]`（按 index 聚合）；非流式 `message.tool_calls[]` |
+
+> 实现说明：转发时不带 `Accept-Encoding`，由 `HttpURLConnection` 自行协商并透明解压 gzip，
+> 因此读到/转发的都是 identity 字节，解析无需再处理压缩。
+
+## 日志：存在哪、怎么命名
+
+- **目录**：由 `proxy.log-dir` 决定，**默认 `./logs`**。这是**相对路径**，相对的是「你启动 `mvn spring-boot:run`（或 `java -jar`）时所在的工作目录」——按上面「运行」的步骤是在 `cli-proxy-logger-java/` 里启动，所以默认就是 `cli-proxy-logger-java/logs/`。想固定位置就用绝对路径，例如 `mvn spring-boot:run -Dspring-boot.run.arguments="--proxy.log-dir=C:\proxy-logs"`，或环境变量 `PROXY_LOG_DIR=C:\proxy-logs`，或直接写进 `application.yml`。
+- **文件名**：按天滚动，`YYYY-MM-DD.jsonl`（系统本地日期 `LocalDate.now()`），每天一个文件。
+- **写入方式**：**追加**（`StandardOpenOption.APPEND`），每来一条请求就追加一行，进程重启不会清空，会继续往当天的文件追加。
+- **内存 vs 磁盘**：UI 列表读的是**内存里最近 500 条**；磁盘 `.jsonl` 则是**全量持久**记录。两者独立。
+
+### 「清空」按钮做什么
+
+UI 顶部 refresh 旁边的 **「清空」** 按钮（带确认弹窗）只清空 **内存列表 / 当前视图**（底层是 `DELETE /api/exchanges` → `ExchangeRecorder.clear()`），**不会删除磁盘上的 `.jsonl` 文件**——磁盘日志是持久审计记录，故意保留。新开一个会话想让界面干净，点它即可。
+
+**想彻底删除磁盘日志**：手动删文件即可。
+```bash
+rm cli-proxy-logger-java/logs/$(date +%F).jsonl   # 删当天
+rm -rf cli-proxy-logger-java/logs                   # 全删（下次启动自动重建目录）
+```
+（Windows PowerShell：`Remove-Item .\logs\*.jsonl` 或 `Remove-Item -Recurse -Force .\logs`。）
+
+日志每行一条 JSON（`<proxy.log-dir>/YYYY-MM-DD.jsonl`），字段与 Node/Python 版一致：`wire` / `method` / `url` / `resStatus` / `durationMs` / `reqHeaders`（脱敏）/ `requestBodyRaw` / `request` / `response`。

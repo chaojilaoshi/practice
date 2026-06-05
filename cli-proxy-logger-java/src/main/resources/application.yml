@@ -1,0 +1,19 @@
+server:
+  # 代理 + Web UI 共用端口（Claude Code/Codex 把 base URL 指向这里）
+  port: 8788
+
+spring:
+  application:
+    name: cli-proxy-logger
+
+# 代理配置（见 ProxyProperties）
+proxy:
+  anthropic-upstream: https://api.anthropic.com
+  openai-upstream: https://api.openai.com
+  log-dir: ./logs
+  redact-auth: true
+  max-body-bytes: 2000000
+
+logging:
+  level:
+    root: info
