@@ -147,7 +147,7 @@ PROXY_OPENAI_UPSTREAM=https://api.freemodel.dev PROXY_ANTHROPIC_UPSTREAM=https:/
 | `parser/WireParser` + `AnthropicParser` / `OpenAiResponsesParser` / `OpenAiChatParser` | 三种 wire 的请求/响应/工具调用解析 |
 | `parser/StreamAggregator` | 流式聚合，重建文本 + 工具调用 |
 | `recorder/ExchangeRecorder` | 内存最近列表 + 按天 JSONL 落盘 |
-| `web/ExchangeApiController` | `/api/exchanges` 查询接口 |
+| `web/ExchangeApiController` | `/api/exchanges` 查询接口 + `DELETE /api/exchanges` 清空内存列表 |
 | `model/*` | 统一数据模型 `Exchange` / `NormalizedRequest` / `NormalizedResponse` / `ToolCall` |
 
 ## 工具调用解析点
@@ -160,3 +160,23 @@ PROXY_OPENAI_UPSTREAM=https://api.freemodel.dev PROXY_ANTHROPIC_UPSTREAM=https:/
 
 > 实现说明：转发时不带 `Accept-Encoding`，由 `HttpURLConnection` 自行协商并透明解压 gzip，
 > 因此读到/转发的都是 identity 字节，解析无需再处理压缩。
+
+## 日志：存在哪、怎么命名
+
+- **目录**：由 `proxy.log-dir` 决定，**默认 `./logs`**。这是**相对路径**，相对的是「你启动 `mvn spring-boot:run`（或 `java -jar`）时所在的工作目录」——按上面「运行」的步骤是在 `cli-proxy-logger-java/` 里启动，所以默认就是 `cli-proxy-logger-java/logs/`。想固定位置就用绝对路径，例如 `mvn spring-boot:run -Dspring-boot.run.arguments="--proxy.log-dir=C:\proxy-logs"`，或环境变量 `PROXY_LOG_DIR=C:\proxy-logs`，或直接写进 `application.yml`。
+- **文件名**：按天滚动，`YYYY-MM-DD.jsonl`（系统本地日期 `LocalDate.now()`），每天一个文件。
+- **写入方式**：**追加**（`StandardOpenOption.APPEND`），每来一条请求就追加一行，进程重启不会清空，会继续往当天的文件追加。
+- **内存 vs 磁盘**：UI 列表读的是**内存里最近 500 条**；磁盘 `.jsonl` 则是**全量持久**记录。两者独立。
+
+### 「清空」按钮做什么
+
+UI 顶部 refresh 旁边的 **「清空」** 按钮（带确认弹窗）只清空 **内存列表 / 当前视图**（底层是 `DELETE /api/exchanges` → `ExchangeRecorder.clear()`），**不会删除磁盘上的 `.jsonl` 文件**——磁盘日志是持久审计记录，故意保留。新开一个会话想让界面干净，点它即可。
+
+**想彻底删除磁盘日志**：手动删文件即可。
+```bash
+rm cli-proxy-logger-java/logs/$(date +%F).jsonl   # 删当天
+rm -rf cli-proxy-logger-java/logs                   # 全删（下次启动自动重建目录）
+```
+（Windows PowerShell：`Remove-Item .\logs\*.jsonl` 或 `Remove-Item -Recurse -Force .\logs`。）
+
+日志每行一条 JSON（`<proxy.log-dir>/YYYY-MM-DD.jsonl`），字段与 Node/Python 版一致：`wire` / `method` / `url` / `resStatus` / `durationMs` / `reqHeaders`（脱敏）/ `requestBodyRaw` / `request` / `response`。

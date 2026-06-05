@@ -175,9 +175,27 @@ python tests/test_proxy.py
 
 `tests/test_proxy.py` 会启动一个 mock 上游 + 代理，覆盖三种 wire 格式的流式/非流式工具调用解析，以及「客户端收到的字节与上游完全一致」的保真性校验（无需任何 API key）。
 
+## 日志：存在哪、怎么命名
+
+- **目录**：由 `LOG_DIR` 环境变量决定，**默认 `./logs`**。这是**相对路径**，相对的是「你启动 `python -m cli_proxy_logger` 时所在的工作目录」——按上面「运行」的步骤是在 `cli-proxy-logger-py/` 里启动，所以默认就是 `cli-proxy-logger-py/logs/`。想固定位置就用绝对路径，例如 `LOG_DIR=C:\proxy-logs python -m cli_proxy_logger`（PowerShell：`$env:LOG_DIR="C:\proxy-logs"; python -m cli_proxy_logger`）。
+- **文件名**：按天滚动，`YYYY-MM-DD.jsonl`（UTC 日期），每天一个文件。
+- **写入方式**：**追加**（append），每来一条请求就追加一行，进程重启不会清空，会继续往当天的文件追加。
+- **内存 vs 磁盘**：UI 列表读的是**内存里最近 500 条**；磁盘 `.jsonl` 则是**全量持久**记录。两者独立。
+
+### 「清空」按钮做什么
+
+UI 顶部 refresh 旁边的 **「清空」** 按钮（带确认弹窗）只清空 **内存列表 / 当前视图**（底层是 `DELETE /api/exchanges`），**不会删除磁盘上的 `.jsonl` 文件**——磁盘日志是持久审计记录，故意保留。新开一个会话想让界面干净，点它即可。
+
+**想彻底删除磁盘日志**：手动删文件即可，例如删当天的：
+```bash
+rm cli-proxy-logger-py/logs/$(date -u +%F).jsonl   # 删当天
+rm -rf cli-proxy-logger-py/logs                      # 全删（下次启动自动重建目录）
+```
+（Windows PowerShell：`Remove-Item .\logs\*.jsonl` 或 `Remove-Item -Recurse -Force .\logs`。）
+
 ## 日志格式
 
-每行一条 JSON（`logs/YYYY-MM-DD.jsonl`），关键字段：
+每行一条 JSON（`<LOG_DIR>/YYYY-MM-DD.jsonl`），关键字段：
 
 - `wire` / `method` / `url` / `resStatus` / `durationMs`
 - `reqHeaders`（脱敏后）/ `requestBodyRaw`
