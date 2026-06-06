@@ -8,10 +8,15 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "test": "node test/run.js && node test/resilience.js && node test/extensions.js"
+    "test": "node test/run.js && node test/resilience.js && node test/extensions.js",
+    "build:exe": "node scripts/build-sea.mjs"
   },
   "engines": {
     "node": ">=18"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.0",
+    "postject": "^1.0.0-alpha.6"
+  }
 }

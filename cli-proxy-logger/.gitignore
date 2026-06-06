@@ -1,6 +1,10 @@
 node_modules/
 dist/
+build/
 logs/
 logs-*/
 *.log
 test/.tmp-logs/
+# user-edited runtime config produced by the visual settings UI
+config.json
+*.exe
