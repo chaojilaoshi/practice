@@ -46,6 +46,8 @@ npm run build:exe  # 产出 dist/cli-proxy-logger.exe
 
 > Windows 上注入后原 Authenticode 签名会失效（属正常），首次运行可能弹 SmartScreen，选「仍要运行」即可；如装有 `signtool` 脚本会自动先移除旧签名。
 
+完整的「打包 → 分发 → 部署 → 运行」步骤（含 Python / Java 三套对照）见仓库根目录 [`DEPLOYMENT.md`](../DEPLOYMENT.md)。
+
 ## 运行（开发 / 命令行方式）
 
 需要 Node.js >= 18（无第三方依赖）。

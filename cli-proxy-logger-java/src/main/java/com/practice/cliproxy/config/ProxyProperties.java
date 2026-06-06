@@ -511,8 +511,10 @@ public class ProxyProperties {
 
     /** 出站代理 URL。配置项优先，否则回退 UPSTREAM_PROXY / HTTPS_PROXY / HTTP_PROXY（含小写）。 */
     public String resolveUpstreamProxyUrl() {
-        if (upstreamProxy != null && !upstreamProxy.isEmpty()) {
-            return upstreamProxy;
+        // 一个非 null 的值表示「显式来自配置文件/参数」：空串 = 明确不走代理（不再回退
+        // 环境变量），非空 = 用它。仅当字段为 null（纯 env/yml 工作流）才回退环境变量。
+        if (upstreamProxy != null) {
+            return upstreamProxy.isEmpty() ? null : upstreamProxy;
         }
         String[] names = {"UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"};
         for (String n : names) {

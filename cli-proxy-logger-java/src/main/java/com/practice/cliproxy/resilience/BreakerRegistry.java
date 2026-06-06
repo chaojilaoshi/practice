@@ -113,9 +113,11 @@ public class BreakerRegistry {
         }
     }
 
-    private final int failureThreshold;
-    private final long cooldownMs;
-    private final int halfOpenMax;
+    // 可视化配置「保存即生效」时这些阈值可被 reconfigure 更新（现存 Breaker 实例直接读
+    // 外层字段，所以无需丢弃已累计的健康状态）。
+    private volatile int failureThreshold;
+    private volatile long cooldownMs;
+    private volatile int halfOpenMax;
     private final LongSupplier nowMs;
     private final Map<String, Breaker> breakers = new LinkedHashMap<>();
 
@@ -128,6 +130,13 @@ public class BreakerRegistry {
         this.cooldownMs = cooldownMs;
         this.halfOpenMax = halfOpenMax;
         this.nowMs = nowMs;
+    }
+
+    /** 热更新熔断阈值（可视化配置保存后调用）；不影响各 provider 已累计的失败状态。 */
+    public synchronized void reconfigure(int failureThreshold, long cooldownMs, int halfOpenMax) {
+        this.failureThreshold = failureThreshold;
+        this.cooldownMs = cooldownMs;
+        this.halfOpenMax = halfOpenMax;
     }
 
     private synchronized Breaker get(String id) {

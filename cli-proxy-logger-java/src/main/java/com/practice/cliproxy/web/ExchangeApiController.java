@@ -1,5 +1,6 @@
 package com.practice.cliproxy.web;
 
+import com.practice.cliproxy.config.SettingsService;
 import com.practice.cliproxy.model.Exchange;
 import com.practice.cliproxy.proxy.ProxyController;
 import com.practice.cliproxy.recorder.ExchangeRecorder;
@@ -7,9 +8,13 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.io.IOException;
 
 import java.util.Collections;
 
@@ -27,16 +32,31 @@ public class ExchangeApiController {
 
     private final ExchangeRecorder recorder;
     private final ProxyController proxyController;
+    private final SettingsService settingsService;
 
-    public ExchangeApiController(ExchangeRecorder recorder, ProxyController proxyController) {
+    public ExchangeApiController(ExchangeRecorder recorder, ProxyController proxyController,
+                                 SettingsService settingsService) {
         this.recorder = recorder;
         this.proxyController = proxyController;
+        this.settingsService = settingsService;
     }
 
     /** 当前生效的 opt-in 配置只读快照（无密钥）。供 UI 的「配置」面板展示。 */
     @GetMapping("/config")
     public Map<String, Object> config() {
         return proxyController.configSummary();
+    }
+
+    /** 可视化配置表单的可编辑 settings（GUI 形状，与 Node/Python 同 schema）。 */
+    @GetMapping("/settings")
+    public Map<String, Object> getSettings() {
+        return settingsService.read();
+    }
+
+    /** 保存并热生效编辑后的 settings。端口变更需重启进程（返回 uiPortChanged=true 提示）。 */
+    @PostMapping("/settings")
+    public Map<String, Object> postSettings(@RequestBody Map<String, Object> settings) throws IOException {
+        return settingsService.apply(settings);
     }
 
     /** 最近请求的摘要列表。 */

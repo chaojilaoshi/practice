@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 dist/
+build/
+*.spec
+config.json
 logs/
 logs-*/
 .tmp-logs/

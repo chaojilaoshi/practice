@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>cli-proxy-logger (py)</title>
+<title>cli-proxy-logger</title>
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --border:#272b36; --fg:#e6e6e6; --muted:#8b93a7;
           --accent:#6ea8fe; --tool:#f0a35e; --err:#ff6b6b; --ok:#5ad17f; }
@@ -36,14 +36,39 @@
   button { background:#222838; color:var(--fg); border:1px solid var(--border); border-radius:4px;
            padding:3px 10px; cursor:pointer; }
   button:hover { background:#2a3142; }
+  button.primary { background:#274690; border-color:#2f57b3; color:#fff; }
+  button.primary:hover { background:#2f57b3; }
+  button.danger { color:var(--err); }
+  /* --- visual settings form --- */
+  .settings { max-width:860px; }
+  .settings h2 { font-size:14px; color:var(--accent); margin:0 0 4px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px 14px; margin:12px 0; }
+  .card > .title { font-weight:600; color:var(--fg); display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .card .hint { color:var(--muted); font-weight:400; font-size:12px; }
+  .field { display:flex; align-items:center; gap:10px; margin:6px 0; flex-wrap:wrap; }
+  .field > label { width:160px; color:var(--muted); }
+  .field input[type=text], .field input[type=number] {
+    background:#0f1115; color:var(--fg); border:1px solid var(--border); border-radius:4px; padding:4px 8px; min-width:240px; }
+  .field input.wide { min-width:420px; flex:1; }
+  table.grid { width:100%; border-collapse:collapse; margin:6px 0; }
+  table.grid th { text-align:left; color:var(--muted); font-weight:500; font-size:12px; padding:4px 6px; border-bottom:1px solid var(--border); }
+  table.grid td { padding:3px 6px; vertical-align:middle; }
+  table.grid input, table.grid select {
+    background:#0f1115; color:var(--fg); border:1px solid var(--border); border-radius:4px; padding:3px 6px; width:100%; }
+  .switch { display:inline-flex; align-items:center; gap:6px; }
+  .savebar { position:sticky; bottom:0; background:var(--bg); padding:12px 0; border-top:1px solid var(--border);
+             display:flex; align-items:center; gap:12px; }
+  .saved-ok { color:var(--ok); } .saved-err { color:var(--err); }
+  .addrow { font-size:12px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>cli-proxy-logger <span class="muted">(py)</span></h1>
+  <h1>cli-proxy-logger</h1>
   <span class="muted" id="count"></span>
   <button id="refresh">refresh</button>
-  <button id="config">config</button>
+  <button id="settings">设置 / 配置</button>
+  <button id="config">config (只读)</button>
   <button id="clear">清空</button>
   <label class="muted"><input type="checkbox" id="auto" checked /> auto</label>
 </header>
@@ -141,7 +166,196 @@ async function loadConfig(){
   detailEl.innerHTML = html;
 }
 
+// ----------------------------------------------------------------------------
+// Visual settings editor: builds a form from /api/settings, lets a non-technical
+// user toggle/fill every option, and POSTs the whole settings object back. The
+// server persists config.json and live-applies it.
+// ----------------------------------------------------------------------------
+let S = null; // working copy of the settings being edited
+
+function getPath(obj, path){ return path.split('.').reduce((o,k)=> (o==null?o:o[k]), obj); }
+function setPath(obj, path, val){
+  const ks = path.split('.'); let o = obj;
+  for(let i=0;i<ks.length-1;i++){ if(o[ks[i]]==null||typeof o[ks[i]]!=='object') o[ks[i]]={}; o=o[ks[i]]; }
+  o[ks[ks.length-1]] = val;
+}
+
+function checkboxField(label, path, hint){
+  const id='cb_'+path.replace(/\W/g,'_');
+  const checked = getPath(S, path) ? 'checked' : '';
+  return '<div class="field"><span class="switch"><input type="checkbox" id="'+id+'" data-path="'+path+'" '+checked+' />'+
+         '<label for="'+id+'">'+esc(label)+'</label></span>'+(hint?'<span class="hint">'+esc(hint)+'</span>':'')+'</div>';
+}
+function textField(label, path, opts){
+  opts = opts||{};
+  const v = getPath(S, path); const val = (v==null?'':v);
+  const type = opts.number?'number':'text';
+  const cls = opts.wide?'wide':'';
+  return '<div class="field"><label>'+esc(label)+'</label>'+
+         '<input type="'+type+'" class="'+cls+'" data-path="'+path+'"'+(opts.number?' data-num="1"':'')+
+         ' value="'+esc(val)+'" placeholder="'+esc(opts.ph||'')+'" /></div>';
+}
+
+// Generic key→value map editor (used for tool-name map and model map).
+function renderKVTable(containerId, arrKey, kLabel, vLabel){
+  const rows = S.__kv[arrKey];
+  let h = '<table class="grid"><thead><tr><th>'+esc(kLabel)+'</th><th>'+esc(vLabel)+'</th><th></th></tr></thead><tbody>';
+  rows.forEach((r,i)=>{
+    h += '<tr>'+
+      '<td><input value="'+esc(r.k)+'" oninput="S.__kv.'+arrKey+'['+i+'].k=this.value" /></td>'+
+      '<td><input value="'+esc(r.v)+'" oninput="S.__kv.'+arrKey+'['+i+'].v=this.value" /></td>'+
+      '<td><button class="danger" onclick="S.__kv.'+arrKey+'.splice('+i+',1);renderKVTable(\''+containerId+'\',\''+arrKey+'\',\''+esc(kLabel)+'\',\''+esc(vLabel)+'\')">删除</button></td></tr>';
+  });
+  h += '</tbody></table>';
+  h += '<button class="addrow" onclick="S.__kv.'+arrKey+'.push({k:\'\',v:\'\'});renderKVTable(\''+containerId+'\',\''+arrKey+'\',\''+esc(kLabel)+'\',\''+esc(vLabel)+'\')">+ 添加一行</button>';
+  document.getElementById(containerId).innerHTML = h;
+}
+
+function renderFilters(){
+  const rows = S.filters;
+  const actions = ['set_header','delete_header','json_set','json_delete'];
+  let h = '<table class="grid"><thead><tr><th>启用</th><th>名称</th><th>动作</th><th>目标</th><th>值</th><th>优先级</th><th>范围</th><th></th></tr></thead><tbody>';
+  rows.forEach((r,i)=>{
+    const opt = actions.map(a=>'<option '+(r.action===a?'selected':'')+'>'+a+'</option>').join('');
+    h += '<tr>'+
+      '<td style="width:42px;text-align:center"><input type="checkbox" '+(r.enabled!==false?'checked':'')+' onchange="S.filters['+i+'].enabled=this.checked" /></td>'+
+      '<td><input value="'+esc(r.name||'')+'" oninput="S.filters['+i+'].name=this.value" /></td>'+
+      '<td style="width:130px"><select onchange="S.filters['+i+'].action=this.value">'+opt+'</select></td>'+
+      '<td><input value="'+esc(r.target||'')+'" placeholder="anthropic-beta / thinking.type" oninput="S.filters['+i+'].target=this.value" /></td>'+
+      '<td><input value="'+esc(r.value==null?'':(typeof r.value==='object'?JSON.stringify(r.value):r.value))+'" oninput="S.filters['+i+'].value=this.value" /></td>'+
+      '<td style="width:70px"><input type="number" value="'+(r.priority||0)+'" oninput="S.filters['+i+'].priority=parseInt(this.value)||0" /></td>'+
+      '<td style="width:120px"><input value="'+esc(r.scope||'all')+'" placeholder="all 或 provider:id" oninput="S.filters['+i+'].scope=this.value" /></td>'+
+      '<td><button class="danger" onclick="S.filters.splice('+i+',1);renderFilters()">删除</button></td></tr>';
+  });
+  h += '</tbody></table><button class="addrow" onclick="S.filters.push({enabled:true,name:\'\',action:\'set_header\',target:\'\',value:\'\',priority:0,scope:\'all\'});renderFilters()">+ 添加规则</button>';
+  document.getElementById('filtersTable').innerHTML = h;
+}
+
+function renderProviders(group, containerId){
+  const rows = S.providers[group];
+  let h = '<table class="grid"><thead><tr><th>id</th><th>baseUrl</th><th>apiKey（可空，留空则透传客户端密钥）</th><th></th></tr></thead><tbody>';
+  rows.forEach((r,i)=>{
+    h += '<tr>'+
+      '<td style="width:140px"><input value="'+esc(r.id||'')+'" oninput="S.providers.'+group+'['+i+'].id=this.value" /></td>'+
+      '<td><input value="'+esc(r.baseUrl||'')+'" placeholder="https://..." oninput="S.providers.'+group+'['+i+'].baseUrl=this.value" /></td>'+
+      '<td><input value="'+esc(r.apiKey||'')+'" oninput="S.providers.'+group+'['+i+'].apiKey=this.value" /></td>'+
+      '<td><button class="danger" onclick="S.providers.'+group+'.splice('+i+',1);renderProviders(\''+group+'\',\''+containerId+'\')">删除</button></td></tr>';
+  });
+  h += '</tbody></table><button class="addrow" onclick="S.providers.'+group+'.push({id:\'\',baseUrl:\'\',apiKey:\'\'});renderProviders(\''+group+'\',\''+containerId+'\')">+ 添加供应商</button>';
+  document.getElementById(containerId).innerHTML = h;
+}
+
+async function loadSettings(){
+  selected = null;
+  document.querySelectorAll('.row').forEach(r=>r.classList.remove('sel'));
+  const res = await fetch('/api/settings');
+  const data = await res.json();
+  S = data.settings;
+  // normalize containers
+  S.filters = Array.isArray(S.filters)?S.filters:[];
+  S.providers = S.providers||{anthropic:[],openai:[]};
+  S.providers.anthropic = S.providers.anthropic||[]; S.providers.openai = S.providers.openai||[];
+  // map objects -> editable arrays of {k,v}
+  S.__kv = {
+    toolNameMap: Object.entries(S.toolName&&S.toolName.map||{}).map(([k,v])=>({k,v:String(v)})),
+    modelMap: Object.entries(S.compat&&S.compat.modelMap||{}).map(([k,v])=>({k,v:String(v)})),
+  };
+
+  let h = '<div class="settings">';
+  h += '<h2>可视化配置</h2><div class="muted">改完点最下方「保存并生效」。保存到 '+esc(data.file||'config.json')+'（来源：'+esc(data.source)+'）。除监听端口外，多数改动立即生效，无需重启。</div>';
+
+  h += '<div class="card"><div class="title">基础</div>';
+  h += textField('代理监听端口','proxyPort',{number:true,ph:'8788'});
+  h += textField('配置界面端口','uiPort',{number:true,ph:'8789'})+'<div class="hint" style="margin-left:170px">改界面端口需重启程序后生效。</div>';
+  h += textField('日志目录(留空=默认)','logDir',{wide:true,ph:'默认 程序目录/logs'});
+  h += textField('Anthropic 上游','upstream.anthropic',{wide:true,ph:'https://api.anthropic.com'});
+  h += textField('OpenAI 上游','upstream.openai',{wide:true,ph:'https://api.openai.com'});
+  h += '</div>';
+
+  h += '<div class="card"><div class="title">工具名规范化 <span class="hint">小写工具名 → PascalCase（如 todowrite→TodoWrite）</span></div>';
+  h += checkboxField('启用工具名规范化','toolName.enabled');
+  h += checkboxField('改写请求侧','toolName.request','tools[].name 与历史 tool_use.name');
+  h += checkboxField('改写响应侧','toolName.response','含 SSE content_block_start');
+  h += checkboxField('修复响应 input','toolName.repairInput','被序列化成字符串的数组/对象还原');
+  h += '<div class="field" style="align-items:flex-start"><label>映射表（覆盖内置）</label><div style="flex:1"><div id="toolNameMapTable"></div></div></div>';
+  h += '</div>';
+
+  h += '<div class="card"><div class="title">请求过滤器 / 规则引擎 <span class="hint">转发上游前改写请求头/请求体</span></div>';
+  h += '<div id="filtersTable"></div>';
+  h += '</div>';
+
+  h += '<div class="card"><div class="title">出站代理 <span class="hint">去上游的连接走外部代理</span></div>';
+  h += textField('代理地址(留空=直连)','outbound.url',{wide:true,ph:'socks5://127.0.0.1:1080 或 http://user:pass@host:3128'});
+  h += '</div>';
+
+  h += '<div class="card"><div class="title">协议翻译 <span class="hint">把 Anthropic /v1/messages 翻成 OpenAI chat（上游只支持 chat 时）</span></div>';
+  h += checkboxField('启用协议翻译(chat)','compat.enabled');
+  h += '<div class="field" style="align-items:flex-start"><label>模型映射</label><div style="flex:1"><div id="modelMapTable"></div></div></div>';
+  h += '</div>';
+
+  h += '<div class="card"><div class="title">供应商池 / 故障转移 <span class="hint">多上游按顺序尝试，配合熔断</span></div>';
+  h += '<div class="muted" style="margin:4px 0">Anthropic 组：</div><div id="provAnthropic"></div>';
+  h += '<div class="muted" style="margin:8px 0 4px">OpenAI 组：</div><div id="provOpenai"></div>';
+  h += '</div>';
+
+  h += '<div class="card"><div class="title">熔断器</div>';
+  h += checkboxField('启用熔断','breaker.enabled');
+  h += textField('失败阈值','breaker.failureThreshold',{number:true,ph:'5'});
+  h += textField('冷却毫秒','breaker.cooldownMs',{number:true,ph:'30000'});
+  h += textField('半开探测并发','breaker.halfOpenMax',{number:true,ph:'1'});
+  h += '</div>';
+
+  h += '<div class="card"><div class="title">Thinking 整流器 <span class="hint">跨供应商切换时自动修签名/budget 并重试</span></div>';
+  h += checkboxField('启用整流器','rectifier.enabled');
+  h += checkboxField('签名整流','rectifier.signature');
+  h += checkboxField('Budget 整流','rectifier.budget');
+  h += '</div>';
+
+  h += '<div class="savebar"><button class="primary" id="saveBtn">保存并生效</button><span id="saveMsg" class="muted"></span></div>';
+  h += '</div>';
+  detailEl.innerHTML = h;
+
+  // bind scalar inputs
+  detailEl.querySelectorAll('[data-path]').forEach(inp=>{
+    const path = inp.getAttribute('data-path');
+    if(inp.type==='checkbox'){ inp.addEventListener('change',()=>setPath(S,path,inp.checked)); }
+    else { inp.addEventListener('input',()=>{ const v = inp.getAttribute('data-num')? (parseInt(inp.value,10)||0) : inp.value; setPath(S,path,v); }); }
+  });
+  renderKVTable('toolNameMapTable','toolNameMap','小写名','规范名(PascalCase)');
+  renderKVTable('modelMapTable','modelMap','客户端模型名','上游模型名');
+  renderFilters();
+  renderProviders('anthropic','provAnthropic');
+  renderProviders('openai','provOpenai');
+  document.getElementById('saveBtn').onclick = saveSettings;
+}
+
+function collectSettings(){
+  // rebuild map objects from the editable arrays
+  const tnMap = {}; S.__kv.toolNameMap.forEach(r=>{ if(r.k) tnMap[r.k]=r.v; });
+  const mMap = {}; S.__kv.modelMap.forEach(r=>{ if(r.k) mMap[r.k]=r.v; });
+  const out = JSON.parse(JSON.stringify(S));
+  delete out.__kv;
+  out.toolName.map = tnMap;
+  out.compat.modelMap = mMap;
+  // coerce numeric filter values that look like numbers stay as typed strings;
+  // server coerces JSON-parseable values, so leave as-is.
+  return out;
+}
+
+async function saveSettings(){
+  const msg = document.getElementById('saveMsg');
+  msg.className='muted'; msg.textContent='保存中…';
+  try{
+    const res = await fetch('/api/settings',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(collectSettings())});
+    const data = await res.json();
+    if(!res.ok || !data.ok){ msg.className='saved-err'; msg.textContent='保存失败：'+(data.error||res.status); return; }
+    let extra = data.uiPortChanged ? '（界面端口已改，请重启程序并访问新端口）' : (data.proxyPortChanged?'（代理端口已切换并立即生效）':'');
+    msg.className='saved-ok'; msg.textContent='已保存并生效 '+extra;
+  }catch(e){ msg.className='saved-err'; msg.textContent='保存出错：'+e.message; }
+}
+
 document.getElementById('refresh').onclick = loadList;
+document.getElementById('settings').onclick = loadSettings;
 document.getElementById('config').onclick = loadConfig;
 document.getElementById('clear').onclick = async () => {
   if(!confirm('清空当前列表？（磁盘上的日志文件保留）')) return;
