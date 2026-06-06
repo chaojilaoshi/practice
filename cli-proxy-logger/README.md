@@ -16,7 +16,39 @@ Claude Code / Codex ──HTTP──▶ 本地代理 :8788 ──HTTPS──▶ 
                                    └─ Web UI :8789
 ```
 
-## 运行
+## 图形界面 / 一键 .exe（给不懂命令行的人）
+
+如果你**完全不想碰命令行或 JSON**，用打包好的单文件 `cli-proxy-logger.exe`：
+
+1. **双击 `cli-proxy-logger.exe`** —— 它会在后台启动代理(8788)和配置页(8789)，并**自动打开浏览器**到配置页（看不到黑窗口）。
+2. 在网页上点 **「设置 / 配置」**，所有配置项都是**可视化表单**：开关、下拉、表格——不用写任何代码或 JSON：
+   - 基础：监听端口、日志目录、Anthropic / OpenAI 上游地址
+   - 工具名规范化：启用开关 + 三个子开关 + 映射表（增删行）
+   - 请求过滤器：表格增删规则（动作下拉 / 目标 / 值 / 优先级 / 范围）
+   - 出站代理：填 `http://` 或 `socks5://` 代理地址
+   - 协议翻译 + 模型映射；供应商池 / 故障转移；熔断器；Thinking 整流器
+3. 点 **「保存并生效」** —— 大多数改动**立即生效，无需重启**（只有改监听端口需要重启程序）。
+
+**配置存哪、读哪**：保存后写到 `.exe` **同目录**的 `config.json`，下次启动自动读取；日志默认写到同目录的 `logs/`。首次启动若没有 `config.json`，会从环境变量种子（兼容老用法），界面顶部会注明来源（`env` / `file`）。
+
+> 默认全关 = 纯透明记录代理（一个字节都不改）。只有你在界面里主动打开某项，那一项才会生效。
+
+### 自己构建 .exe
+
+需要 Node.js >= 20（用到内置的 SEA 单可执行文件能力）。在 `cli-proxy-logger/` 下：
+
+```bash
+npm install        # 安装构建期依赖（esbuild + postject）
+npm run build:exe  # 产出 dist/cli-proxy-logger.exe
+```
+
+构建流程（`scripts/build-sea.mjs`）：esbuild 把应用打成单个 CJS 包 → `node --experimental-sea-config` 生成 blob（含内嵌的 `public/index.html`）→ 复制本机 `node.exe` → postject 把 blob 注入。产物约 70MB，零外部依赖、可直接拷给别人双击运行。
+
+> Windows 上注入后原 Authenticode 签名会失效（属正常），首次运行可能弹 SmartScreen，选「仍要运行」即可；如装有 `signtool` 脚本会自动先移除旧签名。
+
+完整的「打包 → 分发 → 部署 → 运行」步骤（含 Python / Java 三套对照）见仓库根目录 [`DEPLOYMENT.md`](../DEPLOYMENT.md)。
+
+## 运行（开发 / 命令行方式）
 
 需要 Node.js >= 18（无第三方依赖）。
 
@@ -27,7 +59,7 @@ npm start
 # [ui]    open http://127.0.0.1:8789
 ```
 
-打开 http://127.0.0.1:8789 浏览抓到的请求。
+打开 http://127.0.0.1:8789 浏览抓到的请求。命令行方式同样能用「设置 / 配置」可视化表单；不传任何环境变量时行为与之前完全一致（透明代理）。
 
 ## 使用配置模板（Codex / Claude Code / opencode）
 

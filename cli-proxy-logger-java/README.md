@@ -28,6 +28,40 @@ mvn spring-boot:run
 
 > **关于 JDK 版本**：默认 `java.version=8`（最大兼容内网环境）。如果你的环境是 JDK 11/17 且想用更高字节码，把 `pom.xml` 的 `<java.version>` 改成 `11` 或 `17` 即可，代码无需改动（未使用任何 Java 9+ 专有 API）。
 
+## 图形界面 / 一键启动器（给不懂命令行的人）
+
+如果你**完全不想碰命令行或 JSON**，用打包好的「单文件夹应用」——里面有一个 `cli-proxy-logger.exe` 启动器和内置的精简 JRE（**用户机器无需安装 Java**）：
+
+1. **双击 `cli-proxy-logger.exe`** —— 它会启动代理 + 配置页（默认共用 8788），并**自动打开浏览器**到配置页。
+2. 在网页上点 **「设置 / 配置」**，所有配置项都是**可视化表单**：开关、下拉、表格——不用写任何代码或 JSON：
+   - 基础：监听端口、日志目录、Anthropic / OpenAI 上游地址
+   - 工具名规范化：启用开关 + 三个子开关 + 映射表（增删行）
+   - 请求过滤器：表格增删规则（动作下拉 / 目标 / 值 / 优先级 / 范围）
+   - 出站代理：填 `http://` 或 `socks5://` 代理地址
+   - 协议翻译 + 模型映射；供应商池 / 故障转移；熔断器；Thinking 整流器
+3. 点 **「保存并生效」** —— 大多数改动**立即生效，无需重启**（只有改监听端口需要重启程序）。
+
+**配置存哪、读哪**：保存后写到**启动器 `.exe` 同目录**的 `config.json`，下次启动自动读取；日志默认写到同目录的 `logs/`。首次启动若没有 `config.json`，会从环境变量种子（兼容老用法），界面顶部会注明来源（`env` / `file`）。
+
+> 默认全关 = 纯透明记录代理（一个字节都不改）。只有你在界面里主动打开某项，那一项才会生效。
+
+### 自己构建启动器
+
+需要 **JDK 17（含 `jpackage`，本机用 Temurin 17）** + Maven。在 `cli-proxy-logger-java/` 下：
+
+```bash
+# Windows
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
+# macOS / Linux
+bash scripts/build_exe.sh
+```
+
+构建流程（`scripts/build_exe.*`）：先 `mvn -DskipTests clean package` 出 Spring Boot 可执行 fat jar → `jpackage --type app-image` 用 `jlink` 裁出精简运行时镜像 + 生成原生启动器。产物在 `dist/app-image/cli-proxy-logger/`（约 147MB，含内置 JRE），**整个文件夹**即「绿色版」，可整体拷贝给别人，运行其中的启动器即可。
+
+> 注意：**构建** jpackage 需要 JDK 17；但产物自带 JRE，**最终用户机器无需安装任何 Java**。`jpackage` 不跨平台：要 Windows 的 `.exe` 就在 Windows 上构建。Spring Boot 可执行 jar 的真正入口是 `org.springframework.boot.loader.JarLauncher`（脚本里已配好）。
+
+完整的「打包 → 分发 → 部署 → 运行」步骤见仓库根目录 [`DEPLOYMENT.md`](../DEPLOYMENT.md)。
+
 ## 使用配置模板（Codex / Claude Code / opencode）
 
 与 Node 版完全一致，只是本版代理 + UI **共用 8788**。把各 CLI 的 base URL 指向本地代理即可。**最关键的区别：Codex / opencode 的 base URL 带 `/v1`；Claude Code 的不带 `/v1`**（它自己会拼 `/v1/messages`，带了会变成 `/v1/v1/messages` 而 404）。

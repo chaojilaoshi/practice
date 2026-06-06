@@ -100,6 +100,22 @@ public class ProxyController {
                 props.resolveBreakerCooldownMs(), props.resolveBreakerHalfOpenMax());
     }
 
+    /**
+     * 可视化配置「保存即生效」：清空懒加载缓存（供应商池 / 过滤器 / 工具名映射 / 出站代理）
+     * 并按新阈值热更新熔断器。下一次请求会用更新后的 {@link ProxyProperties} 重新解析。
+     */
+    public void reloadFromProps() {
+        synchronized (this) {
+            providerPools = null;
+            filtersCache = null;
+            toolNameMapCache = null;
+            outboundCache = null;
+            outboundResolved = false;
+        }
+        breakers.reconfigure(props.resolveBreakerFailures(),
+                props.resolveBreakerCooldownMs(), props.resolveBreakerHalfOpenMax());
+    }
+
     /** 暴露熔断器注册表（给 UI / 测试做内省，对应 Node 的 proxy.breakers）。 */
     public BreakerRegistry getBreakers() {
         return breakers;

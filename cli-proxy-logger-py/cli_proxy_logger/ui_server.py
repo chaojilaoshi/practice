@@ -4,6 +4,9 @@
     GET    /api/exchanges      -> recent exchange summaries
     GET    /api/exchanges/:id  -> full exchange detail
     DELETE /api/exchanges      -> clear the in-memory list (one-click "清空")
+    GET    /api/config         -> read-only snapshot of active features (no secrets)
+    GET    /api/settings       -> editable settings for the visual config form
+    POST   /api/settings       -> persist + live-apply edited settings
 """
 
 import json
@@ -13,8 +16,11 @@ from pathlib import Path
 from urllib.parse import urlsplit, parse_qs, unquote
 
 from .filters import summarize_filters
+from .settings import read_settings, resource_dir
 
-PUBLIC_DIR = Path(__file__).resolve().parent.parent / "public"
+# When packaged with PyInstaller the public/ assets are extracted to a temp dir
+# (sys._MEIPASS); in dev they sit next to the package. resource_dir() resolves both.
+PUBLIC_DIR = resource_dir() / "public"
 
 
 def _config_summary(config):
@@ -55,7 +61,7 @@ def _config_summary(config):
     }
 
 
-def _make_handler(config, recorder):
+def _make_handler(config, recorder, apply_settings=None, config_file=None):
     class UiHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -69,6 +75,26 @@ def _make_handler(config, recorder):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def do_POST(self):
+            parts = urlsplit(self.path)
+            if parts.path == "/api/settings":
+                if apply_settings is None:
+                    return self._send_json(501, {"error": "settings editing not enabled"})
+                length = int(self.headers.get("content-length") or 0)
+                raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+                try:
+                    parsed = json.loads(raw or "{}")
+                except (ValueError, TypeError):
+                    return self._send_json(400, {"error": "invalid JSON"})
+                result = apply_settings(parsed)
+                return self._send_json(200, {
+                    "ok": True,
+                    "file": str(config_file) if config_file else None,
+                    "proxyPortChanged": bool(result.get("proxyPortChanged")),
+                    "uiPortChanged": bool(result.get("uiPortChanged")),
+                })
+            return self._send_json(404, {"error": "not found"})
 
         def do_DELETE(self):
             # DELETE /api/exchanges empties the in-memory list (UI 的「清空」按钮)。
@@ -85,6 +111,9 @@ def _make_handler(config, recorder):
 
             if p == "/api/config":
                 return self._send_json(200, _config_summary(config))
+            if p == "/api/settings":
+                settings, source, file = read_settings()
+                return self._send_json(200, {"settings": settings, "source": source, "file": str(file)})
             if p == "/api/exchanges":
                 qs = parse_qs(parts.query)
                 limit = int((qs.get("limit") or ["100"])[0])
@@ -120,8 +149,8 @@ def _make_handler(config, recorder):
     return UiHandler
 
 
-def start_ui(config, recorder):
-    handler = _make_handler(config, recorder)
+def start_ui(config, recorder, apply_settings=None, config_file=None):
+    handler = _make_handler(config, recorder, apply_settings, config_file)
     server = ThreadingHTTPServer(("127.0.0.1", config["uiPort"]), handler)
     server.daemon_threads = True
     actual_port = server.server_address[1]

@@ -18,7 +18,39 @@ Claude Code / Codex ──HTTP──▶ 本地代理 :8788 ──HTTPS──▶ 
                                    └─ Web UI :8789
 ```
 
-## 运行
+## 图形界面 / 一键 .exe（给不懂命令行的人）
+
+如果你**完全不想碰命令行或 JSON**，用打包好的单文件 `cli-proxy-logger.exe`：
+
+1. **双击 `cli-proxy-logger.exe`** —— 它会在后台启动代理(8788)和配置页(8789)，并**自动打开浏览器**到配置页。
+2. 在网页上点 **「设置 / 配置」**，所有配置项都是**可视化表单**：开关、下拉、表格——不用写任何代码或 JSON：
+   - 基础：监听端口、日志目录、Anthropic / OpenAI 上游地址
+   - 工具名规范化：启用开关 + 三个子开关 + 映射表（增删行）
+   - 请求过滤器：表格增删规则（动作下拉 / 目标 / 值 / 优先级 / 范围）
+   - 出站代理：填 `http://` 或 `socks5://` 代理地址
+   - 协议翻译 + 模型映射；供应商池 / 故障转移；熔断器；Thinking 整流器
+3. 点 **「保存并生效」** —— 大多数改动**立即生效，无需重启**（只有改监听端口需要重启程序）。
+
+**配置存哪、读哪**：保存后写到 `.exe` **同目录**的 `config.json`，下次启动自动读取；日志默认写到同目录的 `logs/`。首次启动若没有 `config.json`，会从环境变量种子（兼容老用法），界面顶部会注明来源（`env` / `file`）。
+
+> 默认全关 = 纯透明记录代理（一个字节都不改）。只有你在界面里主动打开某项，那一项才会生效。
+
+### 自己构建 .exe
+
+需要 Python（本机实测 3.12）+ PyInstaller（`pip install pyinstaller`）。在 `cli-proxy-logger-py/` 下：
+
+```bash
+pip install pyinstaller          # 仅构建期需要
+python scripts/build_exe.py      # 产出 dist/cli-proxy-logger.exe（约 8.3MB）
+```
+
+构建流程（`scripts/build_exe.py`）：PyInstaller `--onefile` 把 Python 运行时 + `cli_proxy_logger` 包 + 内嵌的 `public/index.html` 打成**一个**自包含可执行文件。入口是 `scripts/entry.py`。运行时用 `sys._MEIPASS` 解析内嵌的 UI 资源。
+
+> PyInstaller **不跨平台编译**：要 Windows 的 `.exe` 就在 Windows 上构建，要 macOS/Linux 的可执行文件就在对应系统上构建。首次在 Windows 运行可能弹 SmartScreen，选「仍要运行」即可。
+
+完整的「打包 → 分发 → 部署 → 运行」步骤见仓库根目录 [`DEPLOYMENT.md`](../DEPLOYMENT.md)。
+
+## 运行（开发 / 命令行方式）
 
 需要 Python >= 3.8（无第三方依赖）。
 
@@ -29,7 +61,7 @@ python -m cli_proxy_logger
 # [ui]    open http://127.0.0.1:8789
 ```
 
-打开 http://127.0.0.1:8789 浏览抓到的请求。
+打开 http://127.0.0.1:8789 浏览抓到的请求。命令行方式同样能用「设置 / 配置」可视化表单；不传任何环境变量时行为与之前完全一致（透明代理）。
 
 > 注：极少数嵌入式/精简版 Python（带 `pythonXY._pth` 的发行版）会忽略 `PYTHONPATH` 和当前目录，导致 `python -m cli_proxy_logger` 报 `No module named`。这种环境下可改用：
 > ```bash
