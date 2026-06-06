@@ -242,6 +242,27 @@ TOOL_NAME_MAP='{"todowrite":"TodoWrite","webfetch":"WebFetch"}' \
 python -m cli_proxy_logger
 ```
 
+**只关响应侧改写**（只规范化发往上游的请求，原样回传上游响应）：
+
+```bash
+TOOL_NAME_CASE=1 TOOL_NAME_RESPONSE=0 python -m cli_proxy_logger
+```
+
+**只做响应修复、不动请求**（例如上游名字已对，只想把序列化成字符串的 `tool_use.input` 还原成数组/对象）：
+
+```bash
+TOOL_NAME_CASE=1 TOOL_NAME_REQUEST=0 TOOL_NAME_RESPONSE=0 TOOL_NAME_REPAIR_INPUT=1 python -m cli_proxy_logger
+```
+
+**用文件加载映射表**（`TOOL_NAME_MAP_FILE`，优先级低于 `TOOL_NAME_MAP`）：
+
+```bash
+cat > tool-name-map.json <<'JSON'
+{ "todowrite": "TodoWrite", "webfetch": "WebFetch", "google_search": "Google_Search" }
+JSON
+TOOL_NAME_CASE=1 TOOL_NAME_MAP_FILE=./tool-name-map.json python -m cli_proxy_logger
+```
+
 ### 2) 请求过滤器 / 规则引擎（`FILTERS=...`）
 
 一组有序规则，在**转发上游前**改写请求头与请求体（JSON）。每条规则：
@@ -266,6 +287,20 @@ python -m cli_proxy_logger
 ```bash
 FILTERS='[{"name":"beta","action":"set_header","target":"anthropic-beta","value":"context-1m-2025-08-07"}]' \
 python -m cli_proxy_logger
+```
+
+**用文件加载过滤器**（`FILTERS_FILE`，优先级低于 `FILTERS`；适合规则较多时维护成独立文件）：
+
+```bash
+cat > filters.json <<'JSON'
+[
+  { "name": "beta-header",    "action": "set_header",  "target": "anthropic-beta",          "value": "context-1m-2025-08-07", "priority": 1 },
+  { "name": "force-adaptive", "action": "json_set",    "target": "thinking.type",           "value": "adaptive",              "priority": 2 },
+  { "name": "min-budget",     "action": "json_set",    "target": "thinking.budget_tokens",  "value": 1024,                     "priority": 3 },
+  { "name": "drop-trace",     "action": "delete_header","target": "x-internal-trace",                                          "priority": 4 }
+]
+JSON
+FILTERS_FILE=./filters.json python -m cli_proxy_logger
 ```
 
 ### 3) 出站代理（`UPSTREAM_PROXY=...`）

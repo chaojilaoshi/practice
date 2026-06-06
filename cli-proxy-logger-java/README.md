@@ -233,6 +233,34 @@ java -jar target/cli-proxy-logger-1.0.0.jar \
   --proxy.tool-name-map='{"todowrite":"TodoWrite","webfetch":"WebFetch"}'
 ```
 
+**只关响应侧改写**（只规范化发往上游的请求，原样回传上游响应）：
+
+```bash
+java -jar target/cli-proxy-logger-1.0.0.jar --proxy.tool-name-case=true --proxy.tool-name-response=false
+# 等价环境变量：TOOL_NAME_CASE=true TOOL_NAME_RESPONSE=false
+```
+
+**只做响应修复、不动请求**（上游名字已对，只想把序列化成字符串的 `tool_use.input` 还原）：
+
+```bash
+java -jar target/cli-proxy-logger-1.0.0.jar \
+  --proxy.tool-name-case=true \
+  --proxy.tool-name-request=false \
+  --proxy.tool-name-response=false \
+  --proxy.tool-name-repair-input=true
+```
+
+**用文件加载映射表**（`proxy.tool-name-map-file`，优先级低于 `proxy.tool-name-map`）：
+
+```bash
+cat > tool-name-map.json <<'JSON'
+{ "todowrite": "TodoWrite", "webfetch": "WebFetch", "google_search": "Google_Search" }
+JSON
+java -jar target/cli-proxy-logger-1.0.0.jar \
+  --proxy.tool-name-case=true \
+  --proxy.tool-name-map-file=./tool-name-map.json
+```
+
 ### 2) 请求过滤器 / 规则引擎（`proxy.filters=...`）
 
 一组有序规则，在**转发上游前**改写请求头与请求体（JSON）。每条规则：
@@ -257,6 +285,20 @@ java -jar target/cli-proxy-logger-1.0.0.jar \
 ```bash
 java -jar target/cli-proxy-logger-1.0.0.jar \
   --proxy.filters='[{"name":"beta","action":"set_header","target":"anthropic-beta","value":"context-1m-2025-08-07"}]'
+```
+
+**用文件加载过滤器**（`proxy.filters-file`，优先级低于 `proxy.filters`；适合规则较多时维护成独立文件）：
+
+```bash
+cat > filters.json <<'JSON'
+[
+  { "name": "beta-header",    "action": "set_header",  "target": "anthropic-beta",          "value": "context-1m-2025-08-07", "priority": 1 },
+  { "name": "force-adaptive", "action": "json_set",    "target": "thinking.type",           "value": "adaptive",              "priority": 2 },
+  { "name": "min-budget",     "action": "json_set",    "target": "thinking.budget_tokens",  "value": 1024,                     "priority": 3 },
+  { "name": "drop-trace",     "action": "delete_header","target": "x-internal-trace",                                          "priority": 4 }
+]
+JSON
+java -jar target/cli-proxy-logger-1.0.0.jar --proxy.filters-file=./filters.json
 ```
 
 ### 3) 出站代理（`proxy.upstream-proxy=...`）
