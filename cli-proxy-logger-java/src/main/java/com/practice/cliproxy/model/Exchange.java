@@ -31,4 +31,9 @@ public class Exchange {
      * 普通透明转发时为 null。
      */
     public Map<String, Object> resilience;
+    /**
+     * 出站改写元数据（仅当 opt-in 的过滤器/工具名规范化对本次请求或响应生效时存在）：
+     * 记录 {filters:[名], toolNamesRewritten?, responseRewrites?}。默认透传时为 null。
+     */
+    public Map<String, Object> mutation;
 }

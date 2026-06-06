@@ -163,6 +163,15 @@ OPENAI_UPSTREAM=https://api.freemodel.dev ANTHROPIC_UPSTREAM=https://cc.freemode
 | `RECTIFY` / `RECTIFIER` | 关闭 | 设 `1` 开启 Anthropic thinking 整流（仅作用于 `/v1/messages`） |
 | `RECTIFY_SIGNATURE` | 开启 | 设 `0` 关闭「签名整流」子规则 |
 | `RECTIFY_BUDGET` | 开启 | 设 `0` 关闭「budget 整流」子规则 |
+| `TOOL_NAME_CASE` | 关闭 | 设 `1` 开启「工具名规范化」（小写→PascalCase，仅作用于 `/v1/messages`，见下节） |
+| `TOOL_NAME_REQUEST` | 开启 | 设 `0` 关闭请求侧工具名改写（`tools[].name` 与历史 `tool_use.name`） |
+| `TOOL_NAME_RESPONSE` | 开启 | 设 `0` 关闭响应侧工具名改写（含 SSE `content_block_start`） |
+| `TOOL_NAME_REPAIR_INPUT` | 开启 | 设 `0` 关闭 `tool_use.input` 修复（被序列化成字符串的数组/对象还原） |
+| `TOOL_NAME_MAP` | 空 | 工具名映射 JSON 对象（`{"todowrite":"TodoWrite"}`），合并/覆盖内置表 |
+| `TOOL_NAME_MAP_FILE` | 空 | 工具名映射 JSON 文件路径（优先于 `TOOL_NAME_MAP`） |
+| `FILTERS` | 空 | 请求过滤器/规则 JSON 数组（见下节）；转发上游前改写请求头/请求体 |
+| `FILTERS_FILE` | 空 | 过滤器 JSON 文件路径（优先于 `FILTERS`） |
+| `UPSTREAM_PROXY` | 空 | 出站代理 URL（`http://`/`https://`/`socks5://`，可带 `user:pass@`）；未设时回退 `HTTPS_PROXY`/`HTTP_PROXY` |
 
 ## 弹性：多供应商故障转移 + 熔断 + thinking 整流（全部 opt-in）
 
@@ -214,6 +223,97 @@ PROVIDERS='[{"id":"a","group":"anthropic","baseUrl":"https://api.vendor-a.com","
 RECTIFY=1 \
 python -m cli_proxy_logger
 ```
+
+## 扩展三件套：工具名规范化 + 请求过滤器 + 出站代理（全部 opt-in）
+
+> 三块互相独立、**默认全关**。不配就和以前完全一样（透明直通、字节级不变）。三套实现（Node/Python/Java）逻辑一致。
+
+### 1) 工具名规范化（`TOOL_NAME_CASE=1`）
+
+有些第三方上游对工具名大小写敏感，要求 `TodoWrite` 这样的 PascalCase，而 opencode/部分客户端会发小写 `todowrite`。开启后代理对 **Anthropic `/v1/messages`** 流量做：
+
+- **请求侧**：把 `tools[].name` 和历史 `messages[].content[].tool_use.name` 从小写改成 PascalCase（内置表 `todowrite→TodoWrite`、`webfetch→WebFetch`、`google_search→Google_Search`，其余首字母大写）。已是 PascalCase 的原样保留。
+- **响应侧**：把响应里 `tool_use.name`（含 SSE `content_block_start` 事件）改回客户端期望的形态；并**修复 `tool_use.input`**——上游有时把数组/对象序列化成 JSON 字符串（`"[\"a\",\"b\"]"`），这里还原成真正的数组/对象。
+- 用 `TOOL_NAME_MAP`（或 `TOOL_NAME_MAP_FILE`）自定义/覆盖映射表；`TOOL_NAME_REQUEST` / `TOOL_NAME_RESPONSE` / `TOOL_NAME_REPAIR_INPUT` 可分别关掉某一侧（默认都开）。
+
+```bash
+TOOL_NAME_CASE=1 \
+TOOL_NAME_MAP='{"todowrite":"TodoWrite","webfetch":"WebFetch"}' \
+python -m cli_proxy_logger
+```
+
+**只关响应侧改写**（只规范化发往上游的请求，原样回传上游响应）：
+
+```bash
+TOOL_NAME_CASE=1 TOOL_NAME_RESPONSE=0 python -m cli_proxy_logger
+```
+
+**只做响应修复、不动请求**（例如上游名字已对，只想把序列化成字符串的 `tool_use.input` 还原成数组/对象）：
+
+```bash
+TOOL_NAME_CASE=1 TOOL_NAME_REQUEST=0 TOOL_NAME_RESPONSE=0 TOOL_NAME_REPAIR_INPUT=1 python -m cli_proxy_logger
+```
+
+**用文件加载映射表**（`TOOL_NAME_MAP_FILE`，优先级低于 `TOOL_NAME_MAP`）：
+
+```bash
+cat > tool-name-map.json <<'JSON'
+{ "todowrite": "TodoWrite", "webfetch": "WebFetch", "google_search": "Google_Search" }
+JSON
+TOOL_NAME_CASE=1 TOOL_NAME_MAP_FILE=./tool-name-map.json python -m cli_proxy_logger
+```
+
+### 2) 请求过滤器 / 规则引擎（`FILTERS=...`）
+
+一组有序规则，在**转发上游前**改写请求头与请求体（JSON）。每条规则：
+
+```json
+[
+  { "name": "beta-header", "action": "set_header", "target": "anthropic-beta", "value": "context-1m-2025-08-07", "priority": 1 },
+  { "name": "force-adaptive", "action": "json_set", "target": "thinking.type", "value": "adaptive", "priority": 2 },
+  { "name": "min-budget", "action": "json_set", "target": "thinking.budget_tokens", "value": 1024, "priority": 3 },
+  { "name": "drop-trace", "action": "delete_header", "target": "x-internal-trace", "priority": 4 },
+  { "name": "vendor-only", "action": "set_header", "target": "x-vendor", "value": "1", "scope": "provider:anthropic-main" }
+]
+```
+
+- **`action`**：`set_header` / `delete_header`（请求头）、`json_set` / `json_delete`（请求体，`target` 为点路径如 `thinking.type`、`metadata.user_id`）。无效 action 的规则会被丢弃。
+- **`value`**：`json_set` 的值支持字符串/数字/布尔/对象（纯数字字符串如 `"1024"` 会强转成数字）。
+- **`priority`**：升序应用（小的先），缺省 `0`。
+- **`enabled`**：设 `false` 跳过该规则。
+- **`scope`**：`all`（默认，所有请求）或 `provider:<id>`（只对该供应商 id 生效，配合「弹性」供应商池）。
+- 命中的规则名记录到 JSONL 的 `mutation` 字段，便于排查。
+
+```bash
+FILTERS='[{"name":"beta","action":"set_header","target":"anthropic-beta","value":"context-1m-2025-08-07"}]' \
+python -m cli_proxy_logger
+```
+
+**用文件加载过滤器**（`FILTERS_FILE`，优先级低于 `FILTERS`；适合规则较多时维护成独立文件）：
+
+```bash
+cat > filters.json <<'JSON'
+[
+  { "name": "beta-header",    "action": "set_header",  "target": "anthropic-beta",          "value": "context-1m-2025-08-07", "priority": 1 },
+  { "name": "force-adaptive", "action": "json_set",    "target": "thinking.type",           "value": "adaptive",              "priority": 2 },
+  { "name": "min-budget",     "action": "json_set",    "target": "thinking.budget_tokens",  "value": 1024,                     "priority": 3 },
+  { "name": "drop-trace",     "action": "delete_header","target": "x-internal-trace",                                          "priority": 4 }
+]
+JSON
+FILTERS_FILE=./filters.json python -m cli_proxy_logger
+```
+
+### 3) 出站代理（`UPSTREAM_PROXY=...`）
+
+让代理**去上游**的连接走一个外部代理（内网出口常见需求）。支持 `http://`、`https://`、`socks5://`（`socks://`、`socks5h://` 视为 socks5），可带 `user:pass@` 鉴权。未设 `UPSTREAM_PROXY` 时回退读 `HTTPS_PROXY`/`HTTP_PROXY`（含小写）。
+
+```bash
+UPSTREAM_PROXY=socks5://127.0.0.1:1080 python -m cli_proxy_logger
+# 或带鉴权的 HTTP 代理：
+UPSTREAM_PROXY=http://user:pass@proxy.example.com:3128 python -m cli_proxy_logger
+```
+
+> Web UI 顶部有「config」按钮，只读展示当前生效的工具名映射规模、过滤器列表、出站代理（脱敏）、翻译/弹性开关，便于核对配置是否按预期加载。
 
 ## 协议翻译：让只支持 `/v1/chat/completions` 的厂商也能跑 Claude Code
 

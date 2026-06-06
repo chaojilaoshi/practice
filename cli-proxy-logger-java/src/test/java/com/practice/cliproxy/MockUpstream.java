@@ -21,6 +21,7 @@ class MockUpstream {
     final AtomicInteger hits = new AtomicInteger();
     volatile String lastBody;
     volatile String lastAuth;
+    volatile java.util.Map<String, String> lastHeaders = new java.util.HashMap<>();
     private final Deque<int[]> statusQueue = new ArrayDeque<>(); // [status]
     private final Deque<String> bodyQueue = new ArrayDeque<>();
     private final Deque<String> ctypeQueue = new ArrayDeque<>();
@@ -33,6 +34,11 @@ class MockUpstream {
         server.createContext("/", exchange -> {
             hits.incrementAndGet();
             lastBody = new String(readAll(exchange.getRequestBody()), StandardCharsets.UTF_8);
+            java.util.Map<String, String> hdrs = new java.util.HashMap<>();
+            for (java.util.Map.Entry<String, java.util.List<String>> e : exchange.getRequestHeaders().entrySet()) {
+                hdrs.put(e.getKey().toLowerCase(java.util.Locale.ROOT), String.join(",", e.getValue()));
+            }
+            lastHeaders = hdrs;
             lastAuth = exchange.getRequestHeaders().getFirst("x-api-key");
             if (lastAuth == null) {
                 lastAuth = exchange.getRequestHeaders().getFirst("Authorization");

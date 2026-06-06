@@ -22,6 +22,13 @@ import { safeJsonParse } from './model.js';
 import { BreakerRegistry } from './breaker.js';
 import { resolveCandidates, wireToGroup } from './providers.js';
 import { detectRectification, applyRectification } from './rectifier.js';
+import { applyFilters } from './filters.js';
+import {
+  normalizeRequestToolNames,
+  rewriteResponseToolNames,
+  repairToolUseInput,
+  rewriteStreamEventToolName,
+} from './transform.js';
 import {
   anthropicRequestToChat,
   chatResponseToAnthropic,
@@ -90,6 +97,188 @@ function makeDecoder(contentEncoding) {
 function truncate(buf, max) {
   if (buf.length <= max) return { text: buf.toString('utf8'), truncated: false };
   return { text: buf.slice(0, max).toString('utf8') + `\n...[truncated ${buf.length - max} bytes]`, truncated: true };
+}
+
+// --- Opt-in outbound request mutation (filters + tool-name normalization) ----
+// Mutates `outHeaders` in place (header filters) and returns the possibly-new
+// body buffer (when body filters / tool-name rewriting changed it). Records what
+// was applied onto `exchange` (when provided) for UI/log visibility. Default
+// path is untouched: returns the original buffer when nothing is configured.
+function applyOutboundMutation(config, wire, providerId, outHeaders, bodyBuf, exchange) {
+  const filters = config.filters;
+  const tn = config.transform?.toolName;
+  const toolNameReq = !!(tn?.enabled && tn.request && wire === 'anthropic');
+  const hasFilters = Array.isArray(filters) && filters.length > 0;
+  if (!hasFilters && !toolNameReq) return bodyBuf;
+
+  const needBody = toolNameReq || (hasFilters && filters.some((f) => f.domain === 'body'));
+  let bodyObj = null;
+  if (needBody && bodyBuf.length > 0) bodyObj = safeJsonParse(bodyBuf.toString('utf8'));
+
+  let changed = false;
+  const meta = {};
+  if (hasFilters) {
+    const res = applyFilters(filters, { providerId, headers: outHeaders, body: bodyObj });
+    if (res.applied.length) meta.filters = res.applied;
+    if (res.bodyChanged) changed = true;
+  }
+  if (toolNameReq && bodyObj) {
+    const n = normalizeRequestToolNames(bodyObj, tn.map);
+    if (n > 0) {
+      meta.toolNamesRewritten = n;
+      changed = true;
+    }
+  }
+  if (exchange && (meta.filters || meta.toolNamesRewritten)) {
+    exchange.mutation = { ...(exchange.mutation || {}), ...meta };
+  }
+  if (changed && bodyObj) return Buffer.from(JSON.stringify(bodyObj));
+  return bodyBuf;
+}
+
+// Should we rewrite the Anthropic RESPONSE (tool names / input repair)? This
+// trades byte-for-byte fidelity for client compatibility, so it only happens
+// when the feature is explicitly enabled for Anthropic traffic.
+function responseRewriteActive(config, wire) {
+  const tn = config.transform?.toolName;
+  return !!(tn?.enabled && wire === 'anthropic' && (tn.response || tn.repairInput));
+}
+
+// Rewrite-and-forward an Anthropic upstream response to the client (instead of
+// the verbatim tee), then record the exchange. Handles both SSE and plain JSON.
+// Because we change the body, we drop content-encoding/length and send identity.
+function forwardRewrittenResponse(upstreamRes, clientRes, exchange, config, recorder, started) {
+  const tn = config.transform.toolName;
+  const status = upstreamRes.statusCode || 502;
+  exchange.resStatus = status;
+  exchange.resHeaders = upstreamRes.headers;
+  const contentType = String(upstreamRes.headers['content-type'] || '');
+  const isSSE = contentType.includes('text/event-stream');
+  const decoder = makeDecoder(upstreamRes.headers['content-encoding']);
+
+  // Outgoing headers: keep everything except framing/encoding we recompute.
+  const baseOut = {};
+  for (const [k, v] of Object.entries(upstreamRes.headers)) {
+    const lk = k.toLowerCase();
+    if (lk === 'content-encoding' || lk === 'content-length' || lk === 'transfer-encoding') continue;
+    baseOut[k] = v;
+  }
+
+  return new Promise((resolve) => {
+    if (isSSE) {
+      clientRes.writeHead(status, baseOut);
+      const sse = new SSEParser();
+      const agg = anthropic.createStreamAggregator();
+      sse.on('event', (e) => agg.feed(e));
+      let lineBuf = '';
+      const flushLines = (final) => {
+        const parts = lineBuf.split('\n');
+        lineBuf = final ? '' : parts.pop();
+        for (const line of parts) clientRes.write(rewriteSSELine(line, tn) + '\n');
+        if (final && lineBuf) clientRes.write(rewriteSSELine(lineBuf, tn) + '\n');
+      };
+      const onDecoded = (buf) => {
+        const text = buf.toString('utf8');
+        sse.push(text); // logging copy
+        lineBuf += text;
+        flushLines(false);
+      };
+      if (decoder) {
+        decoder.on('data', onDecoded);
+        decoder.on('error', () => {});
+      }
+      upstreamRes.on('data', (chunk) => {
+        if (decoder) decoder.write(chunk);
+        else onDecoded(chunk);
+      });
+      upstreamRes.on('end', () => {
+        const finish = () => {
+          flushLines(true);
+          clientRes.end();
+          try {
+            sse.flush();
+            exchange.response = agg.result();
+          } catch (err) {
+            exchange.response = { text: '', toolCalls: [], stopReason: null, usage: null, raw: null, parseError: err.message };
+          }
+          exchange.durationMs = Date.now() - started;
+          recorder.record(exchange);
+          resolve();
+        };
+        if (decoder) decoder.end(() => finish());
+        else finish();
+      });
+      upstreamRes.on('error', (err) => {
+        exchange.error = `upstream stream error: ${err.message}`;
+        exchange.durationMs = Date.now() - started;
+        recorder.record(exchange);
+        clientRes.destroy();
+        resolve();
+      });
+      return;
+    }
+
+    // Non-SSE: buffer the decoded body, rewrite, send with fresh content-length.
+    const dec = [];
+    const onDecoded = (buf) => dec.push(buf);
+    if (decoder) {
+      decoder.on('data', onDecoded);
+      decoder.on('error', () => {});
+    }
+    upstreamRes.on('data', (chunk) => {
+      if (decoder) decoder.write(chunk);
+      else onDecoded(chunk);
+    });
+    upstreamRes.on('end', () => {
+      const finish = () => {
+        const bodyText = Buffer.concat(dec).toString('utf8');
+        const obj = safeJsonParse(bodyText);
+        let outBuf;
+        if (obj && typeof obj === 'object') {
+          let n = 0;
+          if (tn.response) n += rewriteResponseToolNames(obj, tn.map);
+          if (tn.repairInput) n += repairToolUseInput(obj);
+          if (n > 0) exchange.mutation = { ...(exchange.mutation || {}), responseRewrites: n };
+          outBuf = Buffer.from(JSON.stringify(obj));
+        } else {
+          outBuf = Buffer.from(bodyText, 'utf8');
+        }
+        baseOut['content-length'] = String(outBuf.length);
+        clientRes.writeHead(status, baseOut);
+        clientRes.end(outBuf);
+        try {
+          exchange.response = anthropic.parseResponse(obj ? JSON.stringify(obj) : bodyText);
+        } catch (err) {
+          exchange.response = { text: '', toolCalls: [], stopReason: null, usage: null, raw: null, parseError: err.message };
+        }
+        exchange.durationMs = Date.now() - started;
+        recorder.record(exchange);
+        resolve();
+      };
+      if (decoder) decoder.end(() => finish());
+      else finish();
+    });
+    upstreamRes.on('error', (err) => {
+      exchange.error = `upstream stream error: ${err.message}`;
+      exchange.durationMs = Date.now() - started;
+      recorder.record(exchange);
+      clientRes.destroy();
+      resolve();
+    });
+  });
+}
+
+// Transform a single SSE text line: only `data:` lines carrying a tool_use
+// content_block_start are rewritten; everything else (event:, id:, comments,
+// blanks) passes through byte-identical so the event framing is preserved.
+function rewriteSSELine(line, tn) {
+  if (!tn.response || !line.startsWith('data:')) return line;
+  const jsonStr = line.slice(5).trim();
+  if (!jsonStr || jsonStr === '[DONE]') return line;
+  const data = safeJsonParse(jsonStr);
+  if (!data) return line;
+  if (rewriteStreamEventToolName(data, tn.map)) return 'data: ' + JSON.stringify(data);
+  return line;
 }
 
 export function startProxy(config, recorder) {
@@ -166,8 +355,6 @@ function handleRequest(config, recorder, breakers, clientReq, clientRes, reqBody
   for (const [k, v] of Object.entries(clientReq.headers)) {
     if (!HOP_BY_HOP.has(k.toLowerCase())) outHeaders[k] = v;
   }
-  outHeaders['host'] = upstreamUrl.host;
-  if (reqBodyBuf.length > 0) outHeaders['content-length'] = String(reqBodyBuf.length);
 
   // Parse the request body now (it is plain JSON) into the normalized shape.
   // Wrapped in try/catch: a parse bug must never stop us from forwarding.
@@ -194,11 +381,24 @@ function handleRequest(config, recorder, breakers, clientReq, clientRes, reqBody
     error: null,
   };
 
+  // Opt-in request mutation (filters + tool-name normalization) before send,
+  // then (re)compute host + content-length for the body we actually forward.
+  const sendBody = applyOutboundMutation(config, wire, null, outHeaders, reqBodyBuf, exchange);
+  outHeaders['host'] = upstreamUrl.host;
+  if (sendBody.length > 0) outHeaders['content-length'] = String(sendBody.length);
+  const agent = config.outbound ? config.outbound.agentFor(upstreamUrl) : undefined;
+
   // Step 4: open the upstream connection and send the request.
   const upstreamReq = mod.request(
     upstreamUrl,
-    { method: clientReq.method, headers: outHeaders },
+    { method: clientReq.method, headers: outHeaders, agent },
     (upstreamRes) => {
+      // Opt-in: rewrite the Anthropic response (tool names / input repair)
+      // instead of the verbatim tee. Trades fidelity for client compatibility.
+      if (responseRewriteActive(config, wire)) {
+        forwardRewrittenResponse(upstreamRes, clientRes, exchange, config, recorder, started);
+        return;
+      }
       // Step 5: relay the upstream status + headers straight back to the
       // client. Node forwards them as-is (it manages framing for us).
       clientRes.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
@@ -282,7 +482,7 @@ function handleRequest(config, recorder, breakers, clientReq, clientRes, reqBody
     clientRes.end(JSON.stringify({ error: { type: 'proxy_error', message: err.message } }));
   });
 
-  if (reqBodyBuf.length > 0) upstreamReq.write(reqBodyBuf);
+  if (sendBody.length > 0) upstreamReq.write(sendBody);
   upstreamReq.end();
 }
 
@@ -357,7 +557,8 @@ function handleAnthropicToChat(config, recorder, breakers, clientReq, clientRes,
     error: null,
   };
 
-  const upstreamReq = mod.request(upstreamUrl, { method: 'POST', headers: outHeaders }, (upstreamRes) => {
+  const agent = config.outbound ? config.outbound.agentFor(upstreamUrl) : undefined;
+  const upstreamReq = mod.request(upstreamUrl, { method: 'POST', headers: outHeaders, agent }, (upstreamRes) => {
     const status = upstreamRes.statusCode || 502;
     exchange.resStatus = status;
     exchange.resHeaders = upstreamRes.headers;
@@ -518,9 +719,9 @@ function handleAnthropicToChat(config, recorder, breakers, clientReq, clientRes,
 
 // One single HTTP attempt. Resolves with the upstream response object (caller
 // inspects the status) or a connection error — it never writes to the client.
-function transparentAttempt({ mod, upstreamUrl, method, outHeaders, bodyBuf }) {
+function transparentAttempt({ mod, upstreamUrl, method, outHeaders, bodyBuf, agent }) {
   return new Promise((resolve) => {
-    const req = mod.request(upstreamUrl, { method, headers: outHeaders }, (res) => resolve({ kind: 'response', res }));
+    const req = mod.request(upstreamUrl, { method, headers: outHeaders, agent }, (res) => resolve({ kind: 'response', res }));
     req.on('error', (error) => resolve({ kind: 'connError', error }));
     if (bodyBuf.length > 0) req.write(bodyBuf);
     req.end();
@@ -561,8 +762,13 @@ function drainResponse(upstreamRes, config) {
 // Commit a successful 2xx response: stream the bytes to the client (fidelity
 // first) while teeing a decoded copy into the parser. Mirrors the original
 // transparent tee. Resolves after the exchange is recorded.
-function streamUpstreamToClient(upstreamRes, clientRes, exchange, parser, config, recorder, started) {
+function streamUpstreamToClient(upstreamRes, clientRes, exchange, parser, config, recorder, started, wire) {
   return new Promise((resolve) => {
+    // Opt-in: rewrite the Anthropic response instead of the verbatim tee.
+    if (responseRewriteActive(config, wire)) {
+      forwardRewrittenResponse(upstreamRes, clientRes, exchange, config, recorder, started).then(resolve);
+      return;
+    }
     clientRes.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
     exchange.resStatus = upstreamRes.statusCode || 0;
     exchange.resHeaders = upstreamRes.headers;
@@ -693,7 +899,6 @@ async function handleTransparentResilient(config, recorder, breakers, clientReq,
       const upstreamUrl = new URL(clientReq.url, cand.baseUrl);
       const mod = upstreamUrl.protocol === 'https:' ? https : http;
       const outHeaders = { ...baseHeaders, host: upstreamUrl.host };
-      if (bodyBuf.length > 0) outHeaders['content-length'] = String(bodyBuf.length);
       // Provider-specific key override: swap in this provider's credential in
       // the auth style its wire expects. Without an override we forward the
       // client's own header unchanged (transparent default).
@@ -711,7 +916,12 @@ async function handleTransparentResilient(config, recorder, breakers, clientReq,
       exchange.resilience = { providerId: cand.id, attempt: attemptNo };
       if (rectifiedKind) exchange.resilience.rectified = rectifiedKind;
 
-      const attempt = await transparentAttempt({ mod, upstreamUrl, method: clientReq.method, outHeaders, bodyBuf });
+      // Opt-in request mutation (filters + tool-name) scoped to this provider.
+      const sendBody = applyOutboundMutation(config, wire, cand.id, outHeaders, bodyBuf, exchange);
+      if (sendBody.length > 0) outHeaders['content-length'] = String(sendBody.length);
+      const agent = config.outbound ? config.outbound.agentFor(upstreamUrl) : undefined;
+
+      const attempt = await transparentAttempt({ mod, upstreamUrl, method: clientReq.method, outHeaders, bodyBuf: sendBody, agent });
 
       if (attempt.kind === 'connError') {
         exchange.error = `upstream request error: ${attempt.error.message}`;
@@ -726,7 +936,7 @@ async function handleTransparentResilient(config, recorder, breakers, clientReq,
       const status = upstreamRes.statusCode || 0;
 
       if (status >= 200 && status < 300) {
-        await streamUpstreamToClient(upstreamRes, clientRes, exchange, parser, config, recorder, started);
+        await streamUpstreamToClient(upstreamRes, clientRes, exchange, parser, config, recorder, started, wire);
         if (useBreaker) breakers.recordSuccess(cand.id, permit.halfOpen);
         return;
       }

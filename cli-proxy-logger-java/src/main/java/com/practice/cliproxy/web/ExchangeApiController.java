@@ -1,6 +1,7 @@
 package com.practice.cliproxy.web;
 
 import com.practice.cliproxy.model.Exchange;
+import com.practice.cliproxy.proxy.ProxyController;
 import com.practice.cliproxy.recorder.ExchangeRecorder;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -25,9 +26,17 @@ import java.util.Map;
 public class ExchangeApiController {
 
     private final ExchangeRecorder recorder;
+    private final ProxyController proxyController;
 
-    public ExchangeApiController(ExchangeRecorder recorder) {
+    public ExchangeApiController(ExchangeRecorder recorder, ProxyController proxyController) {
         this.recorder = recorder;
+        this.proxyController = proxyController;
+    }
+
+    /** 当前生效的 opt-in 配置只读快照（无密钥）。供 UI 的「配置」面板展示。 */
+    @GetMapping("/config")
+    public Map<String, Object> config() {
+        return proxyController.configSummary();
     }
 
     /** 最近请求的摘要列表。 */

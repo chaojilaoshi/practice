@@ -64,6 +64,26 @@ public class ProxyProperties {
     /** 关闭 budget 子规则（设 false）。回退读环境变量 RECTIFY_BUDGET（"0" 关）。 */
     private Boolean rectifyBudget;
 
+    // ---- 扩展三件套（全部 opt-in；不配置时默认行为完全不变）----------------------
+    /** 开启工具名规范化。回退读环境变量 TOOL_NAME_CASE。 */
+    private Boolean toolNameCase;
+    /** 关闭请求侧工具名改写（设 false）。回退读 TOOL_NAME_REQUEST（"0" 关）。 */
+    private Boolean toolNameRequest;
+    /** 关闭响应侧工具名改写（设 false）。回退读 TOOL_NAME_RESPONSE（"0" 关）。 */
+    private Boolean toolNameResponse;
+    /** 关闭 tool_use.input 修复（设 false）。回退读 TOOL_NAME_REPAIR_INPUT（"0" 关）。 */
+    private Boolean toolNameRepairInput;
+    /** 工具名映射（JSON 对象 {"a":"B"}）。回退读环境变量 TOOL_NAME_MAP。 */
+    private String toolNameMap;
+    /** 工具名映射 JSON 文件路径。回退读环境变量 TOOL_NAME_MAP_FILE。 */
+    private String toolNameMapFile;
+    /** 请求过滤器/规则（JSON 数组）。回退读环境变量 FILTERS。 */
+    private String filters;
+    /** 请求过滤器 JSON 文件路径。回退读环境变量 FILTERS_FILE。 */
+    private String filtersFile;
+    /** 出站代理 URL（http/https/socks5）。回退读 UPSTREAM_PROXY / HTTPS_PROXY / HTTP_PROXY。 */
+    private String upstreamProxy;
+
     public String getAnthropicUpstream() {
         return anthropicUpstream;
     }
@@ -344,5 +364,163 @@ public class ProxyProperties {
         } catch (NumberFormatException e) {
             return fallback;
         }
+    }
+
+    // ---- 扩展三件套：getter/setter + 解析助手 --------------------------------
+
+    public Boolean getToolNameCase() {
+        return toolNameCase;
+    }
+
+    public void setToolNameCase(Boolean toolNameCase) {
+        this.toolNameCase = toolNameCase;
+    }
+
+    public Boolean getToolNameRequest() {
+        return toolNameRequest;
+    }
+
+    public void setToolNameRequest(Boolean toolNameRequest) {
+        this.toolNameRequest = toolNameRequest;
+    }
+
+    public Boolean getToolNameResponse() {
+        return toolNameResponse;
+    }
+
+    public void setToolNameResponse(Boolean toolNameResponse) {
+        this.toolNameResponse = toolNameResponse;
+    }
+
+    public Boolean getToolNameRepairInput() {
+        return toolNameRepairInput;
+    }
+
+    public void setToolNameRepairInput(Boolean toolNameRepairInput) {
+        this.toolNameRepairInput = toolNameRepairInput;
+    }
+
+    public String getToolNameMap() {
+        return toolNameMap;
+    }
+
+    public void setToolNameMap(String toolNameMap) {
+        this.toolNameMap = toolNameMap;
+    }
+
+    public String getToolNameMapFile() {
+        return toolNameMapFile;
+    }
+
+    public void setToolNameMapFile(String toolNameMapFile) {
+        this.toolNameMapFile = toolNameMapFile;
+    }
+
+    public String getFilters() {
+        return filters;
+    }
+
+    public void setFilters(String filters) {
+        this.filters = filters;
+    }
+
+    public String getFiltersFile() {
+        return filtersFile;
+    }
+
+    public void setFiltersFile(String filtersFile) {
+        this.filtersFile = filtersFile;
+    }
+
+    public String getUpstreamProxy() {
+        return upstreamProxy;
+    }
+
+    public void setUpstreamProxy(String upstreamProxy) {
+        this.upstreamProxy = upstreamProxy;
+    }
+
+    /** 是否开启工具名规范化。配置项优先，否则回退裸环境变量 TOOL_NAME_CASE。 */
+    public boolean isToolNameEnabled() {
+        if (toolNameCase != null) {
+            return toolNameCase;
+        }
+        return truthy(System.getenv("TOOL_NAME_CASE"));
+    }
+
+    /** 请求侧改写是否开启（默认开，仅当显式设 false / "0" 关）。 */
+    public boolean isToolNameRequestEnabled() {
+        if (toolNameRequest != null) {
+            return toolNameRequest;
+        }
+        return !"0".equals(System.getenv("TOOL_NAME_REQUEST"));
+    }
+
+    /** 响应侧改写是否开启（默认开）。 */
+    public boolean isToolNameResponseEnabled() {
+        if (toolNameResponse != null) {
+            return toolNameResponse;
+        }
+        return !"0".equals(System.getenv("TOOL_NAME_RESPONSE"));
+    }
+
+    /** tool_use.input 修复是否开启（默认开）。 */
+    public boolean isToolNameRepairInputEnabled() {
+        if (toolNameRepairInput != null) {
+            return toolNameRepairInput;
+        }
+        return !"0".equals(System.getenv("TOOL_NAME_REPAIR_INPUT"));
+    }
+
+    /**
+     * 工具名映射「原始 JSON 字符串」（用户自定义覆盖，交给 ToolNameTransformer 合并到内置表）。
+     * 优先级：proxy.tool-name-map-file / TOOL_NAME_MAP_FILE 文件 &gt; proxy.tool-name-map / TOOL_NAME_MAP。
+     */
+    public String resolveToolNameMapRaw() {
+        String file = (toolNameMapFile != null && !toolNameMapFile.isEmpty())
+                ? toolNameMapFile : System.getenv("TOOL_NAME_MAP_FILE");
+        if (file != null && !file.isEmpty()) {
+            try {
+                return new String(Files.readAllBytes(Paths.get(file)), StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                System.err.println("[config] failed to read TOOL_NAME_MAP_FILE: " + e.getMessage());
+            }
+        }
+        if (toolNameMap != null && !toolNameMap.isEmpty()) {
+            return toolNameMap;
+        }
+        return System.getenv("TOOL_NAME_MAP");
+    }
+
+    /** 过滤器「原始 JSON 数组字符串」（交给 FilterEngine.parseFilters 解析）。 */
+    public String resolveFiltersRaw() {
+        String file = (filtersFile != null && !filtersFile.isEmpty())
+                ? filtersFile : System.getenv("FILTERS_FILE");
+        if (file != null && !file.isEmpty()) {
+            try {
+                return new String(Files.readAllBytes(Paths.get(file)), StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                System.err.println("[config] failed to read FILTERS_FILE: " + e.getMessage());
+            }
+        }
+        if (filters != null && !filters.isEmpty()) {
+            return filters;
+        }
+        return System.getenv("FILTERS");
+    }
+
+    /** 出站代理 URL。配置项优先，否则回退 UPSTREAM_PROXY / HTTPS_PROXY / HTTP_PROXY（含小写）。 */
+    public String resolveUpstreamProxyUrl() {
+        if (upstreamProxy != null && !upstreamProxy.isEmpty()) {
+            return upstreamProxy;
+        }
+        String[] names = {"UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"};
+        for (String n : names) {
+            String v = System.getenv(n);
+            if (v != null && !v.isEmpty()) {
+                return v;
+            }
+        }
+        return null;
     }
 }

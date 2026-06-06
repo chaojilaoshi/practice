@@ -36,6 +36,9 @@ import os
 from pathlib import Path
 
 from .providers import parse_providers
+from .filters import parse_filters
+from .transform import DEFAULT_TOOL_NAME_MAP
+from .outbound import create_outbound
 
 _MODULE_ROOT = Path(__file__).resolve().parent.parent
 
@@ -101,6 +104,39 @@ def _load_providers():
     return parse_providers(os.environ.get("PROVIDERS"))
 
 
+def _load_filters():
+    path = os.environ.get("FILTERS_FILE")
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return parse_filters(fh.read())
+        except OSError as err:
+            print(f"[config] failed to read FILTERS_FILE: {err}")
+    return parse_filters(os.environ.get("FILTERS"))
+
+
+def _load_tool_name_map():
+    """Built-in special cases overlaid with user JSON (TOOL_NAME_MAP inline or
+    TOOL_NAME_MAP_FILE). Keys are case-sensitive; built-ins are lowercase."""
+    name_map = dict(DEFAULT_TOOL_NAME_MAP)
+    raw = os.environ.get("TOOL_NAME_MAP")
+    path = os.environ.get("TOOL_NAME_MAP_FILE")
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = fh.read()
+        except OSError as err:
+            print(f"[config] failed to read TOOL_NAME_MAP_FILE: {err}")
+    if isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                name_map.update(obj)
+        except (ValueError, TypeError):
+            pass
+    return name_map
+
+
 def _parse_statuses(raw, fallback):
     if not isinstance(raw, str) or not raw:
         return set(fallback)
@@ -148,6 +184,28 @@ def load_config(**overrides):
             "signature": os.environ.get("RECTIFY_SIGNATURE") != "0",
             "budget": os.environ.get("RECTIFY_BUDGET") != "0",
         },
+        # Tool-name normalization (opt-in). When enabled, lowercase tool names
+        # are rewritten (default PascalCase + built-in map) on the request, and
+        # optionally on the response, plus array/object inputs serialized as
+        # strings are repaired. Affects Anthropic /v1/messages traffic only.
+        "transform": {
+            "toolName": {
+                "enabled": _bool_env("TOOL_NAME_CASE"),
+                "request": os.environ.get("TOOL_NAME_REQUEST") != "0",
+                "response": os.environ.get("TOOL_NAME_RESPONSE") != "0",
+                "repairInput": os.environ.get("TOOL_NAME_REPAIR_INPUT") != "0",
+                "map": _load_tool_name_map(),
+            },
+        },
+        # Request filters/rules (opt-in): mutate outbound headers/body pre-send.
+        "filters": _load_filters(),
+        # Outbound proxy (opt-in): route upstream connections via an HTTP/SOCKS5
+        # proxy. None when UPSTREAM_PROXY (or HTTPS_PROXY/HTTP_PROXY) is unset.
+        "outbound": create_outbound(
+            os.environ.get("UPSTREAM_PROXY") or os.environ.get("HTTPS_PROXY")
+            or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY")
+            or os.environ.get("http_proxy")
+        ),
     }
     config.update(overrides)
     return config
