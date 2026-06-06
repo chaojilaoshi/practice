@@ -151,8 +151,17 @@ PROXY_OPENAI_UPSTREAM=https://api.freemodel.dev PROXY_ANTHROPIC_UPSTREAM=https:/
 | `proxy.rectify` | 关闭 | 设 `true` 开启 Anthropic thinking 整流（仅作用于 `/v1/messages`） |
 | `proxy.rectify-signature` | 开启 | 设 `false`/`0` 关闭「签名整流」子规则 |
 | `proxy.rectify-budget` | 开启 | 设 `false`/`0` 关闭「budget 整流」子规则 |
+| `proxy.tool-name-case` | 关闭 | 设 `true` 开启「工具名规范化」（小写→PascalCase，仅作用于 `/v1/messages`，见下节） |
+| `proxy.tool-name-request` | 开启 | 设 `false` 关闭请求侧工具名改写（`tools[].name` 与历史 `tool_use.name`） |
+| `proxy.tool-name-response` | 开启 | 设 `false` 关闭响应侧工具名改写（含 SSE `content_block_start`） |
+| `proxy.tool-name-repair-input` | 开启 | 设 `false` 关闭 `tool_use.input` 修复（被序列化成字符串的数组/对象还原） |
+| `proxy.tool-name-map` | 空 | 工具名映射 JSON 对象（`{"todowrite":"TodoWrite"}`），合并/覆盖内置表 |
+| `proxy.tool-name-map-file` | 空 | 工具名映射 JSON 文件路径（优先于 `proxy.tool-name-map`） |
+| `proxy.filters` | 空 | 请求过滤器/规则 JSON 数组（见下节）；转发上游前改写请求头/请求体 |
+| `proxy.filters-file` | 空 | 过滤器 JSON 文件路径（优先于 `proxy.filters`） |
+| `proxy.upstream-proxy` | 空 | 出站代理 URL（`http://`/`https://`/`socks5://`，可带 `user:pass@`）；未设时回退 `HTTPS_PROXY`/`HTTP_PROXY` |
 
-> 这几项都支持环境变量（Spring relaxed binding）：`PROXY_ANTHROPIC_COMPAT` / `PROXY_MODEL_MAP` / `PROXY_MODEL_MAP_FILE`；为与 Node/Python 版保持一致，也兼容裸的 `ANTHROPIC_COMPAT` / `MODEL_MAP` / `MODEL_MAP_FILE`。弹性相关项同理：`PROXY_PROVIDERS` / `PROXY_BREAKER` / `PROXY_BREAKER_FAILURES` / `PROXY_FAILOVER_STATUSES` / `PROXY_RECTIFY` …，也兼容裸的 `PROVIDERS` / `PROVIDERS_FILE` / `BREAKER` / `BREAKER_FAILURES` / `BREAKER_COOLDOWN_MS` / `BREAKER_HALFOPEN_MAX` / `FAILOVER_STATUSES` / `RECTIFY`(或 `RECTIFIER`) / `RECTIFY_SIGNATURE` / `RECTIFY_BUDGET`。
+> 这几项都支持环境变量（Spring relaxed binding）：`PROXY_ANTHROPIC_COMPAT` / `PROXY_MODEL_MAP` / `PROXY_MODEL_MAP_FILE`；为与 Node/Python 版保持一致，也兼容裸的 `ANTHROPIC_COMPAT` / `MODEL_MAP` / `MODEL_MAP_FILE`。弹性相关项同理：`PROXY_PROVIDERS` / `PROXY_BREAKER` / `PROXY_BREAKER_FAILURES` / `PROXY_FAILOVER_STATUSES` / `PROXY_RECTIFY` …，也兼容裸的 `PROVIDERS` / `PROVIDERS_FILE` / `BREAKER` / `BREAKER_FAILURES` / `BREAKER_COOLDOWN_MS` / `BREAKER_HALFOPEN_MAX` / `FAILOVER_STATUSES` / `RECTIFY`(或 `RECTIFIER`) / `RECTIFY_SIGNATURE` / `RECTIFY_BUDGET`。扩展三件套同理：`PROXY_TOOL_NAME_CASE` / `PROXY_FILTERS` / `PROXY_UPSTREAM_PROXY` …，也兼容裸的 `TOOL_NAME_CASE` / `TOOL_NAME_REQUEST` / `TOOL_NAME_RESPONSE` / `TOOL_NAME_REPAIR_INPUT` / `TOOL_NAME_MAP` / `TOOL_NAME_MAP_FILE` / `FILTERS` / `FILTERS_FILE` / `UPSTREAM_PROXY`（出站代理还兼容 `HTTPS_PROXY` / `HTTP_PROXY`）。
 
 ## 弹性：多供应商故障转移 + 熔断 + thinking 整流（全部 opt-in）
 
@@ -205,6 +214,62 @@ java -jar target/cli-proxy-logger-1.0.0.jar \
   --proxy.rectify=true
 ```
 > 也可用环境变量：`PROVIDERS='…' RECTIFY=1 java -jar …`。
+
+## 扩展三件套：工具名规范化 + 请求过滤器 + 出站代理（全部 opt-in）
+
+> 三块互相独立、**默认全关**。不配就和以前完全一样（透明直通、字节级不变）。三套实现（Node/Python/Java）逻辑一致。
+
+### 1) 工具名规范化（`proxy.tool-name-case=true`）
+
+有些第三方上游对工具名大小写敏感，要求 `TodoWrite` 这样的 PascalCase，而 opencode/部分客户端会发小写 `todowrite`。开启后代理对 **Anthropic `/v1/messages`** 流量做：
+
+- **请求侧**：把 `tools[].name` 和历史 `messages[].content[].tool_use.name` 从小写改成 PascalCase（内置表 `todowrite→TodoWrite`、`webfetch→WebFetch`、`google_search→Google_Search`，其余首字母大写）。已是 PascalCase 的原样保留。
+- **响应侧**：把响应里 `tool_use.name`（含 SSE `content_block_start` 事件）改回客户端期望的形态；并**修复 `tool_use.input`**——上游有时把数组/对象序列化成 JSON 字符串（`"[\"a\",\"b\"]"`），这里还原成真正的数组/对象。
+- 用 `proxy.tool-name-map`（或 `proxy.tool-name-map-file`）自定义/覆盖映射表；`proxy.tool-name-request` / `proxy.tool-name-response` / `proxy.tool-name-repair-input` 可分别关掉某一侧（默认都开）。
+
+```bash
+java -jar target/cli-proxy-logger-1.0.0.jar \
+  --proxy.tool-name-case=true \
+  --proxy.tool-name-map='{"todowrite":"TodoWrite","webfetch":"WebFetch"}'
+```
+
+### 2) 请求过滤器 / 规则引擎（`proxy.filters=...`）
+
+一组有序规则，在**转发上游前**改写请求头与请求体（JSON）。每条规则：
+
+```json
+[
+  { "name": "beta-header", "action": "set_header", "target": "anthropic-beta", "value": "context-1m-2025-08-07", "priority": 1 },
+  { "name": "force-adaptive", "action": "json_set", "target": "thinking.type", "value": "adaptive", "priority": 2 },
+  { "name": "min-budget", "action": "json_set", "target": "thinking.budget_tokens", "value": 1024, "priority": 3 },
+  { "name": "drop-trace", "action": "delete_header", "target": "x-internal-trace", "priority": 4 },
+  { "name": "vendor-only", "action": "set_header", "target": "x-vendor", "value": "1", "scope": "provider:anthropic-main" }
+]
+```
+
+- **`action`**：`set_header` / `delete_header`（请求头）、`json_set` / `json_delete`（请求体，`target` 为点路径如 `thinking.type`、`metadata.user_id`）。无效 action 的规则会被丢弃。
+- **`value`**：`json_set` 的值支持字符串/数字/布尔/对象（纯数字字符串如 `"1024"` 会强转成数字）。
+- **`priority`**：升序应用（小的先），缺省 `0`。
+- **`enabled`**：设 `false` 跳过该规则。
+- **`scope`**：`all`（默认，所有请求）或 `provider:<id>`（只对该供应商 id 生效，配合「弹性」供应商池）。
+- 命中的规则名记录到 JSONL 的 `mutation` 字段，便于排查。
+
+```bash
+java -jar target/cli-proxy-logger-1.0.0.jar \
+  --proxy.filters='[{"name":"beta","action":"set_header","target":"anthropic-beta","value":"context-1m-2025-08-07"}]'
+```
+
+### 3) 出站代理（`proxy.upstream-proxy=...`）
+
+让代理**去上游**的连接走一个外部代理（内网出口常见需求）。用内置 `java.net.Proxy` 实现，支持 `http://`、`https://`、`socks5://`（`socks://`、`socks5h://` 视为 socks5），可带 `user:pass@` 鉴权（鉴权时安装进程级 `Authenticator`）。未设 `proxy.upstream-proxy` 时回退读 `UPSTREAM_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY`（含小写）。
+
+```bash
+java -jar target/cli-proxy-logger-1.0.0.jar --proxy.upstream-proxy=socks5://127.0.0.1:1080
+# 或带鉴权的 HTTP 代理：
+java -jar target/cli-proxy-logger-1.0.0.jar --proxy.upstream-proxy=http://user:pass@proxy.example.com:3128
+```
+
+> Web UI 顶部有「config」按钮，只读展示当前生效的工具名映射规模、过滤器列表、出站代理（脱敏）、翻译/弹性开关，便于核对配置是否按预期加载。
 
 ## 协议翻译：让只支持 `/v1/chat/completions` 的厂商也能跑 Claude Code
 
