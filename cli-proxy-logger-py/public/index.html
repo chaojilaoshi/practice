@@ -43,6 +43,7 @@
   <h1>cli-proxy-logger <span class="muted">(py)</span></h1>
   <span class="muted" id="count"></span>
   <button id="refresh">refresh</button>
+  <button id="config">config</button>
   <button id="clear">清空</button>
   <label class="muted"><input type="checkbox" id="auto" checked /> auto</label>
 </header>
@@ -113,7 +114,35 @@ async function loadDetail(id){
   detailEl.innerHTML = html;
 }
 
+// Read-only view of the active opt-in features (filters / tool-name / proxy /
+// resiliency). Configuration is file/env driven; this panel only DISPLAYS it.
+function onoff(b){ return b ? '<span class="badge">on</span>' : '<span class="muted">off</span>'; }
+async function loadConfig(){
+  selected = null;
+  document.querySelectorAll('.row').forEach(r=>r.classList.remove('sel'));
+  const res = await fetch('/api/config');
+  const c = await res.json();
+  let html = '<div><b>Active configuration</b> <span class="muted">(read-only; set via file/env)</span></div>';
+
+  const tn = c.toolName || {};
+  html += section('Tool-name normalization '+onoff(tn.enabled),
+    pre({ request: tn.request, response: tn.response, repairInput: tn.repairInput, mapEntries: tn.mapSize }));
+
+  const f = c.filters || [];
+  html += section('Request filters ('+f.length+')', f.length ? pre(f) : '<div class="empty">none</div>');
+
+  const ob = c.outbound || {};
+  html += section('Outbound proxy '+onoff(ob.enabled), ob.enabled ? pre(ob.describe) : '<div class="empty">direct (none)</div>');
+
+  html += section('Protocol compat', pre({ anthropicTo: c.compat && c.compat.anthropicTo }));
+  html += section('Providers / failover', pre(c.providers));
+  html += section('Circuit breaker '+onoff(c.breaker && c.breaker.enabled), pre(c.breaker));
+  html += section('Thinking rectifier '+onoff(c.rectifier && c.rectifier.enabled), pre(c.rectifier));
+  detailEl.innerHTML = html;
+}
+
 document.getElementById('refresh').onclick = loadList;
+document.getElementById('config').onclick = loadConfig;
 document.getElementById('clear').onclick = async () => {
   if(!confirm('清空当前列表？（磁盘上的日志文件保留）')) return;
   await fetch('/api/exchanges', { method:'DELETE' });

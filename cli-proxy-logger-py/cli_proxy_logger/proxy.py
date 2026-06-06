@@ -20,11 +20,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from .breaker import BreakerRegistry
+from .filters import apply_filters
 from .model import safe_json_parse
 from .parsers import PARSERS, openai_chat
 from .providers import resolve_candidates, wire_to_group
 from .rectifier import detect_rectification, apply_rectification
 from .sse import SSEParser
+from .transform import (
+    normalize_request_tool_names,
+    rewrite_response_tool_names,
+    repair_tool_use_input,
+    rewrite_stream_event_tool_name,
+)
 from .translate import (
     anthropic_request_to_chat,
     chat_response_to_anthropic,
@@ -122,6 +129,76 @@ def _split_upstream(base_url):
     split = urlsplit(base_url)
     scheme = split.scheme or "https"
     return scheme, split.hostname, split.port or (443 if scheme == "https" else 80), split.netloc
+
+
+def _open_connection(config, scheme, host, port):
+    """Open an upstream connection, tunneling via the outbound proxy when one is
+    configured (opt-in). Default path returns a plain stdlib connection."""
+    outbound = config.get("outbound")
+    if outbound:
+        return outbound["connection"](scheme, host, port, 600)
+    if scheme == "https":
+        return http.client.HTTPSConnection(host, port, timeout=600)
+    return http.client.HTTPConnection(host, port, timeout=600)
+
+
+def _apply_outbound_mutation(config, wire, provider_id, out_headers, body_bytes, exchange):
+    """Mutate ``out_headers`` in place (header filters) and return the possibly-new
+    body bytes (when body filters / tool-name rewriting changed it). Records what
+    was applied onto ``exchange`` for UI/log visibility. Default path is
+    untouched: returns the original bytes when nothing is configured."""
+    filters = config.get("filters")
+    tn = (config.get("transform") or {}).get("toolName") or {}
+    tool_name_req = bool(tn.get("enabled") and tn.get("request") and wire == "anthropic")
+    has_filters = isinstance(filters, list) and len(filters) > 0
+    if not has_filters and not tool_name_req:
+        return body_bytes
+
+    need_body = tool_name_req or (has_filters and any(f["domain"] == "body" for f in filters))
+    body_obj = None
+    if need_body and body_bytes:
+        body_obj = safe_json_parse(body_bytes.decode("utf-8", "replace"))
+
+    changed = False
+    meta = {}
+    if has_filters:
+        res = apply_filters(filters, {"providerId": provider_id, "headers": out_headers, "body": body_obj})
+        if res["applied"]:
+            meta["filters"] = res["applied"]
+        if res["bodyChanged"]:
+            changed = True
+    if tool_name_req and isinstance(body_obj, dict):
+        n = normalize_request_tool_names(body_obj, tn.get("map"))
+        if n > 0:
+            meta["toolNamesRewritten"] = n
+            changed = True
+    if exchange is not None and meta:
+        exchange.setdefault("mutation", {}).update(meta)
+    if changed and isinstance(body_obj, dict):
+        return json.dumps(body_obj).encode("utf-8")
+    return body_bytes
+
+
+def _response_rewrite_active(config, wire):
+    """Should we rewrite the Anthropic RESPONSE (tool names / input repair)?"""
+    tn = (config.get("transform") or {}).get("toolName") or {}
+    return bool(tn.get("enabled") and wire == "anthropic" and (tn.get("response") or tn.get("repairInput")))
+
+
+def _rewrite_sse_line(line, tn):
+    """Transform a single SSE text line: only ``data:`` lines carrying a tool_use
+    content_block_start are rewritten; everything else passes through verbatim."""
+    if not tn.get("response") or not line.startswith("data:"):
+        return line
+    json_str = line[5:].strip()
+    if not json_str or json_str == "[DONE]":
+        return line
+    data = safe_json_parse(json_str)
+    if not isinstance(data, dict):
+        return line
+    if rewrite_stream_event_tool_name(data, tn.get("map")):
+        return "data: " + json.dumps(data, separators=(",", ":"))
+    return line
 
 
 def _make_handler(config, recorder):
@@ -225,17 +302,21 @@ def _make_handler(config, recorder):
                 "error": None,
             }
 
+            # Opt-in: apply request filters + tool-name normalization to the
+            # OUTBOUND request (headers/body). No-op when nothing is configured.
+            send_body = _apply_outbound_mutation(config, wire, None, out_headers, req_body, exchange)
+            if send_body is not req_body:
+                out_headers["Content-Length"] = str(len(send_body))
+
             # --- Step 4: open the upstream connection and send the request ---
             # http.client is the stdlib's low-level HTTP/1.1 client. Unlike
             # urllib it lets us stream the response with .read(n), which is what
-            # we need to relay an SSE stream chunk-by-chunk.
-            if scheme == "https":
-                conn = http.client.HTTPSConnection(host, port, timeout=600)
-            else:
-                conn = http.client.HTTPConnection(host, port, timeout=600)
+            # we need to relay an SSE stream chunk-by-chunk. When an outbound
+            # proxy is configured the connection is tunneled through it.
+            conn = _open_connection(config, scheme, host, port)
 
             try:
-                conn.request(self.command, self.path, body=req_body or None, headers=out_headers)
+                conn.request(self.command, self.path, body=send_body or None, headers=out_headers)
                 upstream_res = conn.getresponse()
             except Exception as err:
                 exchange["error"] = f"upstream request error: {err}"
@@ -257,6 +338,13 @@ def _make_handler(config, recorder):
             content_type = upstream_res.getheader("content-type") or ""
             is_sse = "text/event-stream" in content_type
             content_encoding = upstream_res.getheader("content-encoding")
+
+            # Opt-in: rewrite the Anthropic response (tool names / input repair)
+            # instead of the verbatim tee. Only when explicitly enabled.
+            if _response_rewrite_active(config, wire):
+                self._forward_rewritten(upstream_res, exchange, started, config)
+                conn.close()
+                return
 
             # --- Step 5: relay status + headers back to the client -----------
             # We forward the upstream's status line and headers, minus the
@@ -407,10 +495,8 @@ def _make_handler(config, recorder):
             }
 
             # 4) Open the upstream connection and send the translated request.
-            if scheme == "https":
-                conn = http.client.HTTPSConnection(host, port, timeout=600)
-            else:
-                conn = http.client.HTTPConnection(host, port, timeout=600)
+            #    Outbound proxy (opt-in) tunnels this connection when configured.
+            conn = _open_connection(config, scheme, host, port)
             try:
                 conn.request("POST", path, body=chat_body_bytes, headers=out_headers)
                 upstream_res = conn.getresponse()
@@ -566,6 +652,115 @@ def _make_handler(config, recorder):
         #   - any other error (401/403/400/...) is committed to the client as-is.
         # Failover is only possible BEFORE we stream a 2xx to the client.
         # =================================================================
+
+        def _forward_rewritten(self, upstream_res, exchange, started, config):
+            """Rewrite-and-forward an Anthropic upstream response (tool names /
+            input repair) instead of the verbatim tee, then record. Handles both
+            SSE and plain JSON. Because we change the body, we drop
+            content-encoding/length and send identity."""
+            tn = (config.get("transform") or {}).get("toolName") or {}
+            parser = PARSERS[exchange["wire"]]
+            status = upstream_res.status
+            res_header_pairs = upstream_res.getheaders()
+            exchange["resStatus"] = status
+            exchange["resHeaders"] = {k: v for k, v in res_header_pairs}
+            content_type = upstream_res.getheader("content-type") or ""
+            is_sse = "text/event-stream" in content_type
+            decode = _make_stream_decoder(upstream_res.getheader("content-encoding"))
+
+            base_out = [(k, v) for k, v in res_header_pairs
+                        if k.lower() not in ("content-encoding", "content-length", "transfer-encoding")]
+
+            if is_sse:
+                self.send_response_only(status, upstream_res.reason)
+                for k, v in base_out:
+                    self.send_header(k, v)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+
+                sse = SSEParser()
+                agg = parser.create_stream_aggregator()
+                sse.on("event", lambda e: agg["feed"](e))
+                line_buf = ""
+                client_alive = True
+
+                def flush_lines(final):
+                    nonlocal line_buf, client_alive
+                    parts = line_buf.split("\n")
+                    line_buf = "" if final else parts.pop()
+                    for line in parts:
+                        if client_alive:
+                            try:
+                                self.wfile.write((_rewrite_sse_line(line, tn) + "\n").encode("utf-8"))
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionError, OSError):
+                                client_alive = False
+                    if final and line_buf and client_alive:
+                        try:
+                            self.wfile.write((_rewrite_sse_line(line_buf, tn) + "\n").encode("utf-8"))
+                        except (BrokenPipeError, ConnectionError, OSError):
+                            client_alive = False
+
+                while True:
+                    chunk = upstream_res.read(65536)
+                    if not chunk:
+                        break
+                    text = decode(chunk).decode("utf-8", "replace")
+                    sse.push(text)  # logging copy
+                    line_buf += text
+                    flush_lines(False)
+                flush_lines(True)
+                try:
+                    sse.flush()
+                    exchange["response"] = agg["result"]()
+                except Exception as err:
+                    exchange["response"] = {"text": "", "toolCalls": [], "stopReason": None,
+                                            "usage": None, "raw": None, "parseError": str(err)}
+                exchange["durationMs"] = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                recorder.record(exchange)
+                return
+
+            # Non-SSE: buffer decoded body, rewrite, send with fresh length.
+            raw = bytearray()
+            while True:
+                chunk = upstream_res.read(65536)
+                if not chunk:
+                    break
+                raw.extend(decode(chunk))
+            body_text = bytes(raw).decode("utf-8", "replace")
+            obj = safe_json_parse(body_text)
+            if isinstance(obj, dict):
+                n = 0
+                if tn.get("response"):
+                    n += rewrite_response_tool_names(obj, tn.get("map"))
+                if tn.get("repairInput"):
+                    n += repair_tool_use_input(obj)
+                if n > 0:
+                    exchange.setdefault("mutation", {})["responseRewrites"] = n
+                out_buf = json.dumps(obj).encode("utf-8")
+            else:
+                out_buf = body_text.encode("utf-8")
+
+            self.send_response_only(status, upstream_res.reason)
+            for k, v in base_out:
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(out_buf)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                self.wfile.write(out_buf)
+            except (BrokenPipeError, ConnectionError, OSError):
+                pass
+            try:
+                exchange["response"] = parser.parse_response(json.dumps(obj) if isinstance(obj, dict) else body_text)
+            except Exception as err:
+                exchange["response"] = {"text": "", "toolCalls": [], "stopReason": None,
+                                        "usage": None, "raw": None, "parseError": str(err)}
+            exchange["durationMs"] = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            recorder.record(exchange)
+
         def _base_out_headers(self):
             out = {}
             for k, v in self.headers.items():
@@ -712,12 +907,14 @@ def _make_handler(config, recorder):
                     if rectified_kind:
                         exchange["resilience"]["rectified"] = rectified_kind
 
-                    if scheme == "https":
-                        conn = http.client.HTTPSConnection(host, port, timeout=600)
-                    else:
-                        conn = http.client.HTTPConnection(host, port, timeout=600)
+                    # Opt-in: provider-scoped filters + tool-name normalization.
+                    send_body = _apply_outbound_mutation(config, wire, cand["id"], out_headers, body_bytes, exchange)
+                    if send_body is not body_bytes and send_body is not None:
+                        out_headers["Content-Length"] = str(len(send_body))
+
+                    conn = _open_connection(config, scheme, host, port)
                     try:
-                        conn.request(self.command, self.path, body=body_bytes or None, headers=out_headers)
+                        conn.request(self.command, self.path, body=send_body or None, headers=out_headers)
                         upstream_res = conn.getresponse()
                     except Exception as err:
                         exchange["error"] = f"upstream request error: {err}"
@@ -731,7 +928,10 @@ def _make_handler(config, recorder):
 
                     status = upstream_res.status
                     if 200 <= status < 300:
-                        self._commit_stream(upstream_res, parser, exchange, started)
+                        if _response_rewrite_active(config, wire):
+                            self._forward_rewritten(upstream_res, exchange, started, config)
+                        else:
+                            self._commit_stream(upstream_res, parser, exchange, started)
                         conn.close()
                         if use_breaker:
                             breakers.record_success(cand["id"], permit["halfOpen"])
